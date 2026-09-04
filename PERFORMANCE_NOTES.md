@@ -102,25 +102,47 @@ whole reason the width is a type parameter.
 - **Correctness first.** 354 tests, all comparing against ForwardDiff or central
   differences — never a hand-computed number, because a wrong gradient does not
   crash.
-- **Trimmability is the whole point of this package.** Nothing in these fixes
-  should cost it: `literal_pow` is statically resolved per exponent, and the
-  workspace is a concrete struct. But this has **not been re-verified under
-  `--trim` since the changes** — build `adtrim/ProbeDUAL` in the PracticalBayes
-  tree with `--trim=safe`, confirm 0 verifier errors, then run the binary with
-  `JULIA_LOAD_CODEGEN_LIB=0` and diff against the JIT. A clean verifier pass
-  alone proves nothing — that is exactly how ForwardDiff fails under trim.
+- **Trimmability is the whole point of this package.** These fixes were checked
+  against it and are safe: `adtrim/ProbeDUAL` (PracticalBayes tree) builds with
+  **0 verifier errors**, and the binary reproduces the JIT under
+  `JULIA_LOAD_CODEGEN_LIB=0` (max |AD − finite difference| 4.31e-9). The probe
+  exercises the **workspace path with a literal `Val`**, which is the code that
+  needed proving — `literal_pow` resolving per exponent, and the workspace being
+  a concrete struct rather than a closure capture. Re-run that probe after any
+  change here; a clean verifier pass alone proves nothing, which is exactly how
+  ForwardDiff fails under trim.
 - Watch for `Core.Box`: a closure capturing a mutated local produced 14 verifier
   errors before `_grad_chunk!` was split out.
 - **Do not drop a rule for speed.** The lgamma family (`_logabsgamma`) and
   `log1p` are what let Piste express models the other trimmable option cannot:
   STADE rejects `lgamma` outright, and three of the five GLM links in
-  PracticalBayes' `GradMode` fast path need lgamma or log1p terms. That coverage
-  is a capability advantage, not a nicety.
+  PracticalBayes' `GradMode` fast path need lgamma or log1p terms. Piste is the
+  *slowest* of the trimmable options (see below), so coverage is the whole of
+  its case — which makes this rule more important, not less.
 
-## Where the remaining effort should go
+## Where Piste actually stands, and where effort should go
 
 Forward mode is O(K), so even at parity with ForwardDiff it loses to reverse mode
 at large K. Reverse mode now lives in `src/reverse.jl` (trimmable, 0 verifier
-errors, ~15 us at K=200). The division of labour is that reverse covers large K
-and Piste's forward mode covers small K, where a tape's bookkeeping costs more
+errors, ~15 us at K=200). Within Piste, the division of labour is that reverse
+covers large K and forward covers small K, where a tape's bookkeeping costs more
 than it saves — which is exactly the regime these fixes improved most.
+
+Against the alternatives, measured on PracticalBayes' normal-regression
+log-density over an (N,K) grid:
+
+- **STADE beats the best Piste mode in 13 of 16 cells** (1.6x–6.4x, widening
+  with K). It is genuinely faster; an earlier framing here that capability
+  settled the comparison was too quick.
+- **Mooncake beats STADE in 12 of 16.** So the speed ordering is
+  Mooncake > STADE > Piste, and Piste is last.
+
+Piste's case therefore rests entirely on being the only option that is **both
+general and trimmable**: STADE needs a hand-written kernel per model in a
+restricted subset that cannot express `lgamma`, and Mooncake does not trim at
+all. That is a real and narrow niche, and it is worth being honest that it is a
+coverage argument rather than a speed one.
+
+**The gap worth closing next** is reverse mode, which is ~1.5–4x behind STADE.
+That is the mode that should win at large K, and it is where Piste currently
+gives up the most.
