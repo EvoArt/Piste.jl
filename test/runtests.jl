@@ -26,6 +26,9 @@ _d(x, i, ::Val{N}) where {N} = Dual{N,Float64}(x, ntuple(j -> j == i ? 1.0 : 0.0
 # Central difference — the neutral referee.
 _fd(f, x; h=1e-6) = (value(f(x + h)) - value(f(x - h))) / (2h)
 
+# K test points. `range(a, b; length=1)` is an error, hence the special case.
+_pts(K) = K == 1 ? [0.7] : collect(range(0.3, 1.4; length=K))
+
 # A non-separable objective with cross terms, for the driver-level testsets:
 # every element of the gradient depends on its neighbours, so a chunking or
 # workspace bug cannot hide behind a coincidentally-right answer.
@@ -238,7 +241,7 @@ end
         # a single bit of the answer, at any width, including widths that do not
         # divide K. Reference is ForwardDiff, per the rule at the top of this file.
         for K in (1, 5, 13, 40)
-            x = collect(range(0.3, 1.4; length=K))
+            x = _pts(K)
             gref = ForwardDiff.gradient(_rosen, x)
             for N in (1, 4, 8, 16, 32)
                 ga = similar(x); gradient!(ga, _rosen, x, Val(N))
@@ -257,7 +260,7 @@ end
     @testset "workspace allocates nothing after warmup" begin
         # The whole point of the workspace. If this regresses, the driver has
         # started allocating again.
-        x = collect(range(0.3, 1.4; length=50))
+        x = _pts(50)
         g = similar(x)
         ws = GradientWorkspace(x, Val(16))
         gradient!(g, _rosen, x, Val(16), ws)          # warm up / compile
@@ -268,7 +271,7 @@ end
 
     @testset "value_and_gradient! with a workspace" begin
         for K in (1, 7, 20)
-            x = collect(range(0.3, 1.4; length=K))
+            x = _pts(K)
             ws = GradientWorkspace(x, Val(8))
             g = similar(x)
             v, _ = value_and_gradient!(g, _rosen, x, Val(8), ws)
@@ -280,13 +283,13 @@ end
     @testset "a workspace grows for a larger problem" begin
         # Reusing a workspace against a longer x must resize rather than read
         # past the end -- silently wrong gradients are the failure mode here.
-        x_small = collect(range(0.3, 1.4; length=5))
+        x_small = _pts(5)
         ws = GradientWorkspace(x_small, Val(4))
         g_small = similar(x_small)
         gradient!(g_small, _rosen, x_small, Val(4), ws)
         @test g_small ≈ ForwardDiff.gradient(_rosen, x_small)
 
-        x_big = collect(range(0.3, 1.4; length=30))
+        x_big = _pts(30)
         g_big = similar(x_big)
         gradient!(g_big, _rosen, x_big, Val(4), ws)
         @test g_big ≈ ForwardDiff.gradient(_rosen, x_big)
@@ -311,7 +314,7 @@ end
     @testset "pickchunk returns a usable width" begin
         # It must always give a Val, and gradients through it must be right.
         for K in (1, 2, 5, 10, 20, 50, 100, 300)
-            x = collect(range(0.3, 1.4; length=K))
+            x = _pts(K)
             g = similar(x)
             gradient!(g, _rosen, x, pickchunk(K))
             @test g ≈ ForwardDiff.gradient(_rosen, x)
