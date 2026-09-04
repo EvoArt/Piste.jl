@@ -1,0 +1,27 @@
+name = "Piste"
+uuid = "f69a1a94-130c-4fa4-b8d2-e36d656cbe66"
+authors = ["Arthur Newbury <arthur.newbury@gmail.com>"]
+version = "0.1.0"
+
+# SpecialFunctions is the ONLY runtime dependency, and only so that
+# `_logabsgamma` can be given a Dual method — that one function gates the whole
+# Gamma/Beta/Poisson/Binomial/NegBinomial/TDist/Chisq family.
+#
+# Distributions is deliberately NOT a dependency: `Dual <: Real` is what makes
+# `logpdf` work, so nothing in the engine needs it. Test-only.
+[deps]
+SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
+
+[compat]
+SpecialFunctions = "2"
+julia = "1.10"
+
+[extras]
+Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Distributions", "ForwardDiff", "LinearAlgebra", "Random", "Test"]
