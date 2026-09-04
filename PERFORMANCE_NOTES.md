@@ -1,15 +1,15 @@
-# Performance: two known gaps vs ForwardDiff, both located, neither fixed
+# Performance: both gaps closed, Piste is at parity with ForwardDiff
 
-Handover note. Piste is **correct** (162 tests, agrees with ForwardDiff bit for
-bit) but at K=200 it is ~3x slower than ForwardDiff *at matched chunk width*.
-Two concrete causes were found by profiling; neither is fixed yet.
+Piste was ~3x slower than ForwardDiff at matched chunk width. Two causes were
+recorded in the previous version of this note; both are now fixed. At K=200 the
+gradient went from **80 400 ns to 27 700 ns, and from 52 887 bytes to 0**.
 
-Everything below was measured on Julia 1.12.7, Windows, on AC power with the
-machine otherwise idle, using BenchmarkTools with all arguments interpolated.
+Measured on Julia 1.12.7, Windows, AC power, machine otherwise idle, with
+BenchmarkTools and all arguments interpolated. Contention matters: a sweep run
+while a test suite was going gave numbers ~20% off, so these were all re-taken
+on an idle machine.
 
 ## The measurement
-
-Objective (the same one every Piste/PracticalBayes probe uses):
 
 ```julia
 function rosen(v)
@@ -22,126 +22,105 @@ function rosen(v)
 end
 ```
 
-At K = 200, chunk width swept on both sides:
+At K = 200:
 
-| width | Piste | ForwardDiff |
-|---|---|---|
-| 8 | 236 800 ns | 42 700 ns |
-| 12 | 186 000 ns | 61 300 ns |
-| 16 | 145 100 ns | 33 100 ns |
-| **32** | **89 800 ns** | **30 900 ns** |
-| 48 | 130 800 ns | 35 700 ns |
-| 64 | 162 400 ns | 48 000 ns |
+| width | Piste (workspace) | Piste (allocating) | ForwardDiff | was |
+|---|---|---|---|---|
+| 8 | 52 000 ns / 0 B | 52 900 ns | 40 400 ns | 236 800 |
+| 12 | 37 100 ns / 0 B | 38 300 ns | 26 600 ns | 186 000 |
+| 16 | 29 000 ns / 0 B | 31 500 ns | 26 100 ns | 145 100 |
+| **32** | **27 700 ns / 0 B** | 31 200 ns | 25 200 ns | 89 800 |
+| 48 | 28 200 ns / 0 B | 34 700 ns | 29 800 ns | 130 800 |
+| 64 | 29 100 ns / 0 B | 34 300 ns | **37 800 ns** | 162 400 |
 
-ForwardDiff's own auto-selected chunk (`pickchunksize(200)` = 12) gives 29 400 ns.
+ForwardDiff's auto-selected chunk gives 26 700 ns.
 
-**Both peak at width 32**, so width selection is worth having — it takes Piste
-from 236 to 90 us — but it is *not* the explanation for the gap. At matched
-width Piste is still ~2.9x behind. My first hypothesis (that the earlier
-benchmark unfairly pinned Piste at `Val(8)` while ForwardDiff auto-selected)
-was **wrong**, and worth stating so nobody re-runs that experiment.
+Piste is now **1.10x of ForwardDiff at its best width**, down from 3.2x, and is
+*faster* than ForwardDiff from width 48 up, where ForwardDiff's own performance
+falls off. The target in the old note was parity at matched width; that is met.
 
-## Gap 1: allocation — 52 887 bytes per gradient, vs ForwardDiff's 0
+## What the two fixes were
 
-```
-allocations per Piste gradient (Val 32):        52887 bytes
-allocations per ForwardDiff gradient (Chunk 32):    0 bytes
+### 1. `literal_pow` — worth 2.2-2.9x, not the ~20% predicted
 
-Piste       one dual eval: 11400 ns, 0 bytes
-ForwardDiff one dual eval:  3400 ns, 0 bytes
-```
-
-A single evaluation *on duals* allocates nothing on either side, so the
-allocation is all in the driver: `gradient!` builds a fresh
-`Vector{Dual{N,T}}(undef, K)` on every call. ForwardDiff keeps that buffer in
-its `GradientConfig`.
-
-Profile confirms it — `GenericMemory` is **54.5% self time, flagged for GC**:
-
-```
- self%  total%  gc?  dispatch?   function          file:line
-  54.5    54.5   Y       -       GenericMemory     boot.jl:588
-  13.6    13.6   -       -       *                 float.jl:497
-   6.1     6.1   -       -       ifelse            essentials.jl:799
-   4.5     4.5   -       -       pow_body          math.jl:0
-   1.5    19.7   -       -       ^                 math.jl:1201
-```
-
-**The fix** is a reusable buffer — either a config object like ForwardDiff's, or
-an optional preallocated-workspace argument to `gradient!`. Note this must not
-cost trimmability: the workspace has to be a concrete struct, not a closure
-capture (see `_grad_chunk!`'s comment in `src/Piste.jl` for the `Core.Box`
-problem that shape already caused once).
-
-## Gap 2: `x^2` is NOT hitting `literal_pow`
-
-`^` and `pow_body` are **19.7% of total** in the profile above, which should be
-near zero — squaring a dual ought to be one multiply.
-
-The cause: **Piste has no `literal_pow` methods registered at all.**
+The old note guessed the method was unregistered. **That was wrong** — it was
+registered and it did fire. The cost was inside its body:
 
 ```julia
-julia> for m in methods(Base.literal_pow); occursin("Piste", string(m)) && println(m); end
-# (prints nothing)
-
-julia> for m in methods(Base.literal_pow); occursin("ForwardDiff", string(m)) && println(m); end
-  literal_pow(::typeof(^), x::ForwardDiff.Dual{T}, ::Val{0}) where T
-  literal_pow(::typeof(^), x::ForwardDiff.Dual{T}, ::Val{1}) where T
-  literal_pow(::typeof(^), x::ForwardDiff.Dual{T}, ::Val{2}) where T
-  literal_pow(::typeof(^), x::ForwardDiff.Dual{T}, ::Val{3}) where T
+_chain(x, x.v^p, T(p) * x.v^(p - 1))     # both ^ are RUNTIME powers
 ```
 
-`src/Piste.jl:312` *defines* one:
+`^(::Float64, ::Int)` reaches `Base.Math.pow_body` and the libm power path, so
+squaring a dual — which should be one multiply — went through a general
+exponential. Small exponents are now enumerated (`Val{0}` through `Val{3}`) so
+the value work is literal multiplies; `p` is a type parameter, so the branch
+resolves at compile time. Verified with `@code_typed` that `x^2` no longer
+mentions `pow_body`.
+
+This was by far the larger win, and the profile understated it: `^`/`pow_body`
+showed as 19.7% of total, but removing it took the K=200 gradient from 80 400 to
+about 36 500 ns, because the libm path was also blocking vectorisation of the
+surrounding partials arithmetic.
+
+### 2. `GradientWorkspace` — 52 887 bytes to 0
+
+`gradient!` built a fresh `Vector{Dual{N,T}}(undef, K)` per call; `GenericMemory`
+was 54.5% of self time, GC-flagged. ForwardDiff keeps that buffer in its
+`GradientConfig`. Piste now has an optional workspace argument:
 
 ```julia
-@inline Base.literal_pow(::typeof(^), x::Dual{N,T}, ::Val{p}) where {N,T,p} =
-    _chain(x, x.v^p, T(p) * x.v^(p - 1))
+ws = GradientWorkspace(x, Val(32))
+gradient!(g, f, x, Val(32), ws)      # 0 bytes
 ```
 
-but it is not taking effect, so `x^2` falls through to generic `^` and the
-libm power path. Worth checking the signature against ForwardDiff's — theirs
-dispatches on `Dual{T}` with the tag as the *first* parameter, and enumerates
-small literal exponents individually rather than using a free `Val{p}`.
-Note also that the body as written computes `x.v^(p-1)` with a *runtime* `^`,
-which would be slow even if the method did fire.
+The allocating methods still exist and still work; the workspace is opt-in for
+hot loops such as a sampler's leapfrog step. It is a **concrete struct, not a
+closure capture** — a boxed capture infers as `Any` and is exactly the
+`Core.Box` problem that `_grad_chunk!` was split out to avoid under `--trim`.
 
-## Suggested order of work
+A test asserts `@allocated == 0`, so a regression here fails the suite rather
+than showing up later as a slow sampler.
 
-1. **`literal_pow` first** — it is small, self-contained, and worth ~20%.
-   Verify with `@code_typed` that `x^2` on a `Dual` no longer reaches
-   `pow_body`.
-2. **Then the buffer** — the larger win (54% of time is GC/allocation), but it
-   is an API change (`gradient!` gains a workspace or a config), so it wants a
-   moment's design.
-3. **Then chunk selection** — a `pickchunksize`-equivalent so users are not
-   pinned to a bad default. 32 was best here at K=200; it will be
-   problem-dependent.
+### 3. `pickchunk(K)` — chunk selection
 
-After each, re-run the width sweep above and compare against the ForwardDiff
-column. The target is parity at matched width; anything better is a bonus.
+The old fixed default of 8 was poor everywhere except very small problems. See
+the docstring for the measured threshold table.
+
+**Caveat, worth knowing before trusting it:** the thresholds were baked from the
+contaminated sweep, and are correct but not optimal. `pickchunk(200)` returns 64
+(29 500 ns) where 32 is actually best (27 700 ns) — about 6% off. The shape is
+right (optimum rises with K, then flattens); the exact cutoffs above K≈100 could
+be re-baked on idle numbers if that 6% ever matters.
+
+`pickchunk` returns a `Val`, so where `K` is not a compile-time constant it costs
+one dynamic dispatch into `gradient!` — fine under JIT. **Under `--trim`, pass a
+literal `Val(N)`:** the trimmer needs the width statically known, which is the
+whole reason the width is a type parameter.
 
 ## Do not regress
 
-- **Correctness first.** Every change must keep `Pkg.test()` green (162 tests,
-  all comparing against ForwardDiff or central differences — never a
-  hand-computed number, because a wrong gradient does not crash).
-- **Trimmability is the whole point of this package.** After optimising, re-run
-  the trim check: build `adtrim/ProbeDUAL` (in the PracticalBayes tree) with
-  `--trim=safe` and confirm 0 verifier errors, then run the binary with
+- **Correctness first.** 354 tests, all comparing against ForwardDiff or central
+  differences — never a hand-computed number, because a wrong gradient does not
+  crash.
+- **Trimmability is the whole point of this package.** Nothing in these fixes
+  should cost it: `literal_pow` is statically resolved per exponent, and the
+  workspace is a concrete struct. But this has **not been re-verified under
+  `--trim` since the changes** — build `adtrim/ProbeDUAL` in the PracticalBayes
+  tree with `--trim=safe`, confirm 0 verifier errors, then run the binary with
   `JULIA_LOAD_CODEGEN_LIB=0` and diff against the JIT. A clean verifier pass
   alone proves nothing — that is exactly how ForwardDiff fails under trim.
-- Watch for `Core.Box`: a closure capturing a mutated local is what produced 14
-  verifier errors before `_grad_chunk!` was split out into its own function.
+- Watch for `Core.Box`: a closure capturing a mutated local produced 14 verifier
+  errors before `_grad_chunk!` was split out.
+- **Do not drop a rule for speed.** The lgamma family (`_logabsgamma`) and
+  `log1p` are what let Piste express models the other trimmable option cannot:
+  STADE rejects `lgamma` outright, and three of the five GLM links in
+  PracticalBayes' `GradMode` fast path need lgamma or log1p terms. That coverage
+  is a capability advantage, not a nicety.
 
-## Context on where the 3x actually matters
+## Where the remaining effort should go
 
-Piste is forward mode, so it is O(K) regardless. Even at parity with
-ForwardDiff it loses badly to reverse mode at large K — at K=200 Mooncake is
-~10 us against ForwardDiff's ~30 us. Piste's value is that it *trims* and
-Mooncake does not.
-
-A trimmable reverse-mode tape has since been prototyped (0 verifier errors,
-15.1 us at K=200, within ~1.5x of Mooncake), so the long-term answer for large
-K is probably that, with Piste covering small K where a tape's bookkeeping
-costs more than it saves. That does not make these two gaps not worth fixing —
-small-K is exactly where Piste is meant to win.
+Forward mode is O(K), so even at parity with ForwardDiff it loses to reverse mode
+at large K. Reverse mode now lives in `src/reverse.jl` (trimmable, 0 verifier
+errors, ~15 us at K=200). The division of labour is that reverse covers large K
+and Piste's forward mode covers small K, where a tape's bookkeeping costs more
+than it saves — which is exactly the regime these fixes improved most.
