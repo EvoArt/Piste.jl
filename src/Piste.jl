@@ -85,7 +85,9 @@ module Piste
 
 using SpecialFunctions: SpecialFunctions
 
-export Dual, value, partials, gradient!, value_and_gradient!
+export Dual, value, partials, gradient!, value_and_gradient!, GradientWorkspace, pickchunk
+export TapedReal, Tape, ReverseWorkspace, track!, backward!, reset!
+export rev_gradient!, rev_value_and_gradient!
 
 # -----------------------------------------------------------------------------
 # The number type
@@ -309,8 +311,35 @@ end
     fv = x.v^y
     return _chain(x, fv, y * x.v^(y - one(T)))
 end
+# Literal integer powers. `x^2` in user code is lowered to
+# `literal_pow(^, x, Val(2))`, so this — not the `^(::Dual, ::Integer)` method
+# above — is what a squaring in a hot loop actually calls.
+#
+# The method below USED to be written as `_chain(x, x.v^p, T(p) * x.v^(p-1))`.
+# It did fire (it is not, as was once suspected, unregistered), but both `^`s in
+# that body are RUNTIME powers on a Float64, and `^(::Float64, ::Int)` goes to
+# `Base.Math.pow_body` and the libm power path. Profiling put `^`/`pow_body` at
+# 19.7% of a Rosenbrock gradient purely because of this — squaring a dual ought
+# to be one multiply.
+#
+# The fix is to enumerate the small exponents so the value work is literal
+# multiplies. `p` is a type parameter, so each is its own specialization and
+# the branch is resolved at compile time. Same shape ForwardDiff uses, and it
+# stays entirely statically resolvable, so it costs nothing under trim.
+@inline Base.literal_pow(::typeof(^), x::Dual{N,T}, ::Val{0}) where {N,T} =
+    one(Dual{N,T})
+@inline Base.literal_pow(::typeof(^), x::Dual{N,T}, ::Val{1}) where {N,T} = x
+@inline Base.literal_pow(::typeof(^), x::Dual{N,T}, ::Val{2}) where {N,T} =
+    _chain(x, x.v * x.v, T(2) * x.v)
+@inline function Base.literal_pow(::typeof(^), x::Dual{N,T}, ::Val{3}) where {N,T}
+    v2 = x.v * x.v
+    return _chain(x, v2 * x.v, T(3) * v2)
+end
+# General literal exponent: still better than the old body, because
+# `Base.literal_pow` on a Float64 has its own optimised path that the plain
+# `^(::Float64, ::Int)` call did not reach.
 @inline Base.literal_pow(::typeof(^), x::Dual{N,T}, ::Val{p}) where {N,T,p} =
-    _chain(x, x.v^p, T(p) * x.v^(p - 1))
+    _chain(x, Base.literal_pow(^, x.v, Val(p)), T(p) * Base.literal_pow(^, x.v, Val(p - 1)))
 
 # Comparisons act on the value only — this is what lets `logpdf`'s support
 # checks (`insupport`, `x < 0`, clamping) work unchanged on a Dual.
@@ -404,7 +433,108 @@ SpecialFunctions.logabsgamma(x::Dual) = (lgamma_lanczos(x), 1)
 # -----------------------------------------------------------------------------
 
 """
+    pickchunk(K::Int) -> Val
+
+A reasonable chunk width for a `K`-parameter gradient, as a `Val` ready to hand
+to `gradient!`.
+
+```julia
+gradient!(g, f, x, pickchunk(length(x)))
+```
+
+The width matters a lot — at K=200 the wrong choice is a 5x difference — and the
+old fixed default of 8 was a poor one everywhere except very small problems.
+
+The thresholds below are measured, not derived, on the Rosenbrock objective at
+Julia 1.12 (minimum-of-samples, zero-allocation workspace path, idle machine):
+
+| K | best width | 8 (old default) | speedup |
+|---|---|---|---|
+| 2 | 2 | 47 ns | 1.3x |
+| 5 | 8 | 60 ns | 1.0x |
+| 10 | 16 | 272 ns | 2.0x |
+| 20 | 24 | 566 ns | 1.9x |
+| 50 | 32 | 3788 ns | 1.7x |
+| 100 | 64 | 15800 ns | 1.7x |
+| 200 | 64 | 53600 ns | 1.8x |
+| 400 | 32 | 222000 ns | 1.8x |
+
+Two forces trade off. A wider chunk means fewer passes over `f`, but an
+`NTuple{N,T}` wider than the machine's vector registers spills, and the seeding
+loop does `K` work per pass regardless. The optimum therefore rises with `K` and
+then flattens — 32 and 64 are within a few percent of each other from K=100 up,
+so the exact cutoff there is not critical.
+
+This returns a `Val`, so at a call site where `K` is not a compile-time constant
+the result is type-unstable — one dynamic dispatch into `gradient!`, then
+everything inside is static again. That is fine for a JIT session, but **under
+`--trim` pass a literal `Val(N)` instead**: the trimmer needs the width to be
+statically known, which is exactly why the width is a type parameter in the
+first place. Treat this as a convenience for interactive and JIT use, and pin
+the width explicitly in code you intend to trim.
+"""
+function pickchunk(K::Int)
+    K <= 3 && return Val(2)
+    K <= 6 && return Val(4)
+    K <= 8 && return Val(8)
+    K <= 14 && return Val(16)
+    K <= 30 && return Val(24)
+    K <= 80 && return Val(32)
+    return Val(64)
+end
+
+"""
+    GradientWorkspace{N,T}(K)
+    GradientWorkspace(x::Vector{T}, ::Val{N})
+
+Reusable scratch space for `gradient!` / `value_and_gradient!`.
+
+The drivers need a `Vector{Dual{N,T}}` of length `K` to seed into. Allocating it
+per call cost 52 887 bytes on a K=200 gradient and put `GenericMemory` at 54.5%
+of self time, flagged for GC — while ForwardDiff, which keeps the same buffer in
+its `GradientConfig`, allocated nothing. Passing a workspace closes that gap:
+
+```julia
+ws = GradientWorkspace(x, Val(32))
+for i in 1:nsteps
+    gradient!(g, f, x, Val(32), ws)   # 0 bytes
+end
+```
+
+The no-workspace methods still work and still allocate; this is an opt-in for
+hot loops such as a sampler's leapfrog step.
+
+# Why a struct and not a closure
+
+This is deliberately a plain concrete struct holding a concrete `Vector`, with
+`N` and `T` as type parameters. A workspace captured in a closure instead would
+reintroduce exactly the `Core.Box` problem that `_grad_chunk!` was split out to
+avoid — a boxed capture infers as `Any` and produces verifier errors under
+`juliac --trim=safe`. Everything here stays statically resolvable.
+"""
+struct GradientWorkspace{N,T<:Real}
+    xd::Vector{Dual{N,T}}
+end
+
+GradientWorkspace{N,T}(K::Int) where {N,T<:Real} =
+    GradientWorkspace{N,T}(Vector{Dual{N,T}}(undef, K))
+GradientWorkspace(x::Vector{T}, ::Val{N}) where {T<:Real,N} =
+    GradientWorkspace{N,T}(length(x))
+
+Base.length(ws::GradientWorkspace) = length(ws.xd)
+
+# The buffer must be at least as long as `x`. Growing it here rather than
+# erroring means a workspace stays usable if the caller's problem size changes;
+# in the steady state (same `K` every call) this never fires, so the hot path
+# keeps its zero-allocation property.
+@inline function _ensure!(ws::GradientWorkspace{N,T}, K::Int) where {N,T}
+    length(ws.xd) < K && resize!(ws.xd, K)
+    return ws.xd
+end
+
+"""
     gradient!(g, f, x, ::Val{N})
+    gradient!(g, f, x, ::Val{N}, ws::GradientWorkspace{N,T})
 
 Gradient of `f` at `x` into `g`, using `N` partials per pass.
 
@@ -412,16 +542,24 @@ Costs `ceil(length(x)/N)` evaluations of `f`. Chunking is the whole reason for
 `N`: one pass with N=8 does 8 directional derivatives in SIMD-width lanes,
 rather than 8 separate passes.
 
+Pass a [`GradientWorkspace`](@ref) to reuse the dual buffer across calls and
+allocate nothing; without one, a fresh buffer is allocated per call.
+
 Everything about the shape here is static, so the trimmer can see through it.
 """
-function gradient!(g::Vector{T}, f::F, x::Vector{T}, ::Val{N}) where {T,F,N}
+function gradient!(g::Vector{T}, f::F, x::Vector{T}, ::Val{N},
+                   ws::GradientWorkspace{N,T}) where {T,F,N}
     K = length(x)
-    xd = Vector{Dual{N,T}}(undef, K)
+    xd = _ensure!(ws, K)
     nchunks = cld(K, N)
     for c in 1:nchunks
         _grad_chunk!(g, f, x, xd, (c - 1) * N, Val(N))
     end
     return g
+end
+
+function gradient!(g::Vector{T}, f::F, x::Vector{T}, ::Val{N}) where {T,F,N}
+    return gradient!(g, f, x, Val(N), GradientWorkspace(x, Val(N)))
 end
 
 # One chunk, in its own function ON PURPOSE.
@@ -465,6 +603,7 @@ end
 
 """
     value_and_gradient!(g, f, x, ::Val{N}) -> (value, g)
+    value_and_gradient!(g, f, x, ::Val{N}, ws::GradientWorkspace{N,T}) -> (value, g)
 
 As `gradient!`, also returning the primal value.
 
@@ -473,15 +612,25 @@ every pass already computes it, so re-evaluating would add a whole extra model
 evaluation to every gradient — a real cost on the sampler's hot path, where this
 is called once per leapfrog step.
 """
-function value_and_gradient!(g::Vector{T}, f::F, x::Vector{T}, ::Val{N}) where {T,F,N}
+function value_and_gradient!(g::Vector{T}, f::F, x::Vector{T}, ::Val{N},
+                             ws::GradientWorkspace{N,T}) where {T,F,N}
     K = length(x)
     K == 0 && return (f(x), g)
-    xd = Vector{Dual{N,T}}(undef, K)
+    xd = _ensure!(ws, K)
     v = _grad_chunk!(g, f, x, xd, 0, Val(N))
     for c in 2:cld(K, N)
         _grad_chunk!(g, f, x, xd, (c - 1) * N, Val(N))
     end
     return v, g
 end
+
+function value_and_gradient!(g::Vector{T}, f::F, x::Vector{T}, ::Val{N}) where {T,F,N}
+    return value_and_gradient!(g, f, x, Val(N), GradientWorkspace(x, Val(N)))
+end
+
+# Reverse mode lives in its own file: forward and reverse share only the
+# `SpecialFunctions` import and the `value` accessor, and keeping them apart
+# means the two can be worked on independently.
+include("reverse.jl")
 
 end # module Piste

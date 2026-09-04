@@ -11,6 +11,8 @@
 
 using Piste
 using Piste: Dual, value, partials, gradient!, value_and_gradient!
+using Piste: GradientWorkspace, pickchunk
+using Piste: TapedReal, Tape, ReverseWorkspace, track!, reset!, rev_gradient!, rev_value_and_gradient!
 import SpecialFunctions
 using Test
 using Distributions
@@ -23,6 +25,19 @@ _d(x, i, ::Val{N}) where {N} = Dual{N,Float64}(x, ntuple(j -> j == i ? 1.0 : 0.0
 
 # Central difference — the neutral referee.
 _fd(f, x; h=1e-6) = (value(f(x + h)) - value(f(x - h))) / (2h)
+
+# A non-separable objective with cross terms, for the driver-level testsets:
+# every element of the gradient depends on its neighbours, so a chunking or
+# workspace bug cannot hide behind a coincidentally-right answer.
+function _rosen(v)
+    s = zero(eltype(v))
+    @inbounds for i in 1:(length(v) - 1)
+        a = v[i + 1] - v[i]^2
+        b = one(eltype(v)) - v[i]
+        s = s + 100 * a^2 + b^2
+    end
+    return s
+end
 
 @testset "Piste.jl" begin
 
@@ -217,4 +232,91 @@ _fd(f, x; h=1e-6) = (value(f(x + h)) - value(f(x - h))) / (2h)
         @test all(iszero, partials(c))
         @test all(iszero, partials(exp(c) * log(c) + sqrt(c)))
     end
+
+    @testset "workspace path matches the allocating path" begin
+        # The workspace is purely an allocation optimisation: it must not change
+        # a single bit of the answer, at any width, including widths that do not
+        # divide K. Reference is ForwardDiff, per the rule at the top of this file.
+        for K in (1, 5, 13, 40)
+            x = collect(range(0.3, 1.4; length=K))
+            gref = ForwardDiff.gradient(_rosen, x)
+            for N in (1, 4, 8, 16, 32)
+                ga = similar(x); gradient!(ga, _rosen, x, Val(N))
+                ws = GradientWorkspace(x, Val(N))
+                gw = similar(x); gradient!(gw, _rosen, x, Val(N), ws)
+                @test ga == gw
+                @test gw ≈ gref
+                # reusing the SAME workspace must give the same answer again --
+                # a stale buffer would show up here and nowhere else
+                gw2 = similar(x); gradient!(gw2, _rosen, x, Val(N), ws)
+                @test gw2 == gw
+            end
+        end
+    end
+
+    @testset "workspace allocates nothing after warmup" begin
+        # The whole point of the workspace. If this regresses, the driver has
+        # started allocating again.
+        x = collect(range(0.3, 1.4; length=50))
+        g = similar(x)
+        ws = GradientWorkspace(x, Val(16))
+        gradient!(g, _rosen, x, Val(16), ws)          # warm up / compile
+        @test (@allocated gradient!(g, _rosen, x, Val(16), ws)) == 0
+        value_and_gradient!(g, _rosen, x, Val(16), ws)
+        @test (@allocated value_and_gradient!(g, _rosen, x, Val(16), ws)) == 0
+    end
+
+    @testset "value_and_gradient! with a workspace" begin
+        for K in (1, 7, 20)
+            x = collect(range(0.3, 1.4; length=K))
+            ws = GradientWorkspace(x, Val(8))
+            g = similar(x)
+            v, _ = value_and_gradient!(g, _rosen, x, Val(8), ws)
+            @test v == _rosen(x)
+            @test g ≈ ForwardDiff.gradient(_rosen, x)
+        end
+    end
+
+    @testset "a workspace grows for a larger problem" begin
+        # Reusing a workspace against a longer x must resize rather than read
+        # past the end -- silently wrong gradients are the failure mode here.
+        x_small = collect(range(0.3, 1.4; length=5))
+        ws = GradientWorkspace(x_small, Val(4))
+        g_small = similar(x_small)
+        gradient!(g_small, _rosen, x_small, Val(4), ws)
+        @test g_small ≈ ForwardDiff.gradient(_rosen, x_small)
+
+        x_big = collect(range(0.3, 1.4; length=30))
+        g_big = similar(x_big)
+        gradient!(g_big, _rosen, x_big, Val(4), ws)
+        @test g_big ≈ ForwardDiff.gradient(_rosen, x_big)
+    end
+
+    @testset "literal_pow (regression: was routing through pow_body)" begin
+        # `x^2` lowers to literal_pow. The rule fired but computed its value
+        # with a runtime `^`, which cost ~2x on the whole gradient. These check
+        # the fast paths agree with the general one and with ForwardDiff.
+        for p in 0:6, xv in (0.4, 1.0, 1.7, 3.2)
+            f = v -> Base.literal_pow(^, v[1], Val(p))
+            @test partials(f([_d(xv, 1, Val(1))]))[1] ≈
+                  ForwardDiff.gradient(f, [xv])[1]
+        end
+        # x^1 must be the identity, x^0 a true constant
+        d = _d(1.7, 1, Val(4))
+        @test Base.literal_pow(^, d, Val(1)) === d
+        @test all(iszero, partials(Base.literal_pow(^, d, Val(0))))
+        @test value(Base.literal_pow(^, d, Val(0))) == 1.0
+    end
+
+    @testset "pickchunk returns a usable width" begin
+        # It must always give a Val, and gradients through it must be right.
+        for K in (1, 2, 5, 10, 20, 50, 100, 300)
+            x = collect(range(0.3, 1.4; length=K))
+            g = similar(x)
+            gradient!(g, _rosen, x, pickchunk(K))
+            @test g ≈ ForwardDiff.gradient(_rosen, x)
+        end
+    end
+
+    include("reverse.jl")
 end
