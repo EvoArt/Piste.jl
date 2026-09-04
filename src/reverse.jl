@@ -81,6 +81,7 @@ const OP_LGAMMA = Int8(22)
 const OP_FMA    = Int8(23)  # a*b + c-as-a-node: two inputs, partials in c/d
 const OP_LINEAR = Int8(24)  # a*ca + b*cb with CONSTANT coefficients
 const OP_DOT    = Int8(25)  # a dot product: one node for the whole reduction
+const OP_MATVEC = Int8(26)  # one row of X*beta; the matrix lives in the side table
 
 """
     Node
@@ -128,16 +129,30 @@ worth ~2x at K=200.
 mutable struct Tape
     nodes::Vector{Node}
     n::Int
+    # Side table for ARRAY-level operations. A `Node` is deliberately isbits and
+    # fixed-size, so it cannot hold a matrix; instead an array-level node stores
+    # an index into here, and the reverse sweep looks the operand up.
+    #
+    # This is what lets `X * beta` be ~N nodes instead of ~2NK: the adjoint of a
+    # matrix-vector product is another matrix-vector product (X' * adj), one
+    # BLAS call, rather than N*K scalar accumulations. Stan does the same thing
+    # with its matrix `vari` types, and it is what keeps it competitive.
+    #
+    # It holds only plain data (the DATA matrix and the tracked inputs' tape
+    # indices), never a closure, so nothing here costs trimmability.
+    mats::Vector{Matrix{Float64}}
+    idxs::Vector{UnitRange{Int32}}
 end
 
-Tape() = Tape(Node[], 0)
+Tape() = Tape(Node[], 0, Matrix{Float64}[], UnitRange{Int32}[])
 
 """
     Tape(capacity::Int)
 
 Preallocate for a known node count, so even the first sweep does not grow.
 """
-Tape(capacity::Integer) = Tape(Vector{Node}(undef, Int(capacity)), 0)
+Tape(capacity::Integer) = Tape(Vector{Node}(undef, Int(capacity)), 0,
+                              Matrix{Float64}[], UnitRange{Int32}[])
 
 """
     reset!(t) -> t
@@ -147,6 +162,8 @@ memory. This is what makes repeated gradient calls cheap.
 """
 @inline function reset!(t::Tape)
     t.n = 0
+    empty!(t.mats)
+    empty!(t.idxs)
     return t
 end
 
@@ -427,6 +444,109 @@ function dot_tracked(xs::AbstractVector{TapedReal}, cs::AbstractVector{<:Real})
     return acc
 end
 
+"""
+    *(X::AbstractMatrix{<:Real}, b::AbstractVector{TapedReal})
+
+Matrix-vector product recorded at ARRAY level: one node per output element,
+carrying an index to the matrix, instead of ~2K scalar nodes each.
+
+This is the single biggest saving available on a regression log-density.
+Elementwise, `X * beta` with N=1000, K=50 taped ~58 000 nodes and profiling put
+**80% of gradient time in building the tape**, `_setindex!` alone at 29.9%. The
+adjoint of a matvec is just another matvec — `X' * adj` — so there is no reason
+to record the scalar decomposition at all.
+
+The saving is asymptotic, not constant-factor: N*K nodes become N.
+"""
+# NOTE ON DISPATCH. `AbstractMatrix * AbstractVector{TapedReal}` is NOT specific
+# enough: LinearAlgebra defines
+#     *(A::StridedMatrix{T}, x::StridedVector{S}) where {T<:Float64, S<:Real}
+# and since `TapedReal <: Real` that method is MORE specific for the common case
+# of a plain `Matrix{Float64}` times a `Vector{TapedReal}`. It wins, and the
+# product silently falls back to the elementwise path — measured, the node count
+# went back to scaling with N*K instead of N, with no error to notice.
+#
+# Matching `StridedVecOrMat` on the left restores precedence for exactly the
+# shapes that method claims, and the AbstractMatrix method below still catches
+# everything else.
+# LinearAlgebra's method is
+#     *(A::StridedMatrix{T}, x::StridedVector{S}) where {T<:Union{Float32,Float64,...}, S<:Real}
+# which pins the ELEMENT type of A. To take precedence for a tracked right-hand
+# side, this has to be at least as specific on the left and strictly more
+# specific on the right (`TapedReal` rather than `S<:Real`).
+function Base.:*(X::StridedMatrix{Float64}, b::StridedVector{TapedReal})
+    return _matvec_taped(X, b)
+end
+function Base.:*(X::StridedMatrix{Float32}, b::StridedVector{TapedReal})
+    return _matvec_taped(X, b)
+end
+function Base.:*(X::StridedMatrix{<:Real}, b::StridedVector{TapedReal})
+    return _matvec_taped(X, b)
+end
+function Base.:*(X::AbstractMatrix{<:Real}, b::AbstractVector{TapedReal})
+    return _matvec_taped(X, b)
+end
+
+function _matvec_taped(X::AbstractMatrix{<:Real}, b::AbstractVector{TapedReal})
+    n, k = size(X)
+    k == length(b) || throw(DimensionMismatch("matrix has $k columns, vector has $(length(b))"))
+    n == 0 && return TapedReal[]
+    t = _livetape_vec(b)
+    t === _DETACHED && return [TapedReal(_DETACHED, Int32(0), _dotv(X, b, i)) for i in 1:n]
+
+    # The tracked inputs must occupy a CONTIGUOUS index range for the reverse
+    # sweep to find them, so attach any detached entries and re-record if they
+    # are not already contiguous. In the normal case (a parameter vector fresh
+    # from `track!`) they are, and this is a no-op scan.
+    lo, hi, contiguous = _index_span(b)
+    if !contiguous
+        bb = similar(b)
+        @inbounds for j in 1:k
+            bb[j] = record!(t, OP_MULC, _attach(t, b[j]).idx, Int32(0), b[j].v, 1.0)
+        end
+        lo, hi, _ = _index_span(bb)
+    end
+
+    push!(t.mats, Matrix{Float64}(X))
+    push!(t.idxs, lo:hi)
+    m = Int32(length(t.mats))
+
+    out = Vector{TapedReal}(undef, n)
+    @inbounds for i in 1:n
+        # `c` carries the side-table slot, `d` the row -- both as Float64, which
+        # is exact for any realistic N.
+        out[i] = record!(t, OP_MATVEC, lo, hi, _dotv(X, b, i), Float64(m), Float64(i))
+    end
+    return out
+end
+
+@inline function _dotv(X, b, i)
+    s = 0.0
+    @inbounds for j in 1:length(b)
+        s = muladd(Float64(X[i, j]), b[j].v, s)
+    end
+    return s
+end
+
+@inline function _livetape_vec(b::AbstractVector{TapedReal})
+    @inbounds for x in b
+        _isdetached(x) || return x.tape
+    end
+    return _DETACHED
+end
+
+# Are the tracked entries a contiguous ascending run of tape indices?
+function _index_span(b::AbstractVector{TapedReal})
+    @inbounds lo = b[1].idx
+    hi = lo
+    ok = true
+    @inbounds for j in 2:length(b)
+        b[j].idx == b[j-1].idx + Int32(1) || (ok = false)
+        hi = b[j].idx
+    end
+    return lo, hi, ok && (hi - lo + Int32(1) == Int32(length(b)))
+end
+
 @inline _linear1(t::Tape, x::TapedReal, c::Float64) =
     record!(t, OP_MULC, _attach(t, x).idx, Int32(0), x.v * c, c)
 
@@ -534,6 +654,7 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
     end
     @inbounds adj[out] = 1.0
     nodes = t.nodes
+    mats = t.mats
     @inbounds for i in n:-1:1
         ai = adj[i]
         # Skipping zero adjoints is a real saving: a log-density's tape has many
@@ -589,6 +710,17 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
             adj[nd.a] += ai * exp(nodes[nd.a].v)
         elseif op == OP_LGAMMA
             adj[nd.a] += ai * SpecialFunctions.digamma(nodes[nd.a].v)
+        elseif op == OP_MATVEC
+            # One row of X*beta. `c` is the side-table slot, `d` the row index;
+            # `a`/`b` bound the parameter range. Scattering here is the same
+            # arithmetic X' * adj would do, done row by row as the sweep walks
+            # backwards -- so it stays a single pass with no extra allocation.
+            Xm = mats[Int(nd.c)]
+            row = Int(nd.d)
+            base = Int(nd.a)
+            @inbounds for j in 1:(Int(nd.b) - base + 1)
+                adj[base + j - 1] += ai * Xm[row, j]
+            end
         elseif op == OP_FMA || op == OP_LINEAR
             # Both saved their two partials at record time, which is the whole
             # point: the reverse sweep is two multiply-accumulates for what

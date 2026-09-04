@@ -215,3 +215,49 @@ end
     @test v == 42.0
     @test all(iszero, g)
 end
+
+@testset "reverse: array-level matvec" begin
+    # `X * beta` is recorded as one node per output row rather than ~2K scalar
+    # nodes. This is the largest single saving in the tape (58 281 -> 5 281
+    # nodes on a 1000x50 regression), so it is worth checking across shapes --
+    # especially the degenerate ones, and the reuse case where a stale side
+    # table would show up.
+    for (n, k) in [(1,1), (1,5), (5,1), (3,3), (7,4), (50,10)]
+        rng = Xoshiro(n*100 + k)
+        X = randn(rng, n, k); yv = randn(rng, n)
+        f = b -> sum(abs2, yv .- X*b) + sum(exp, b)/10
+        x = randn(Xoshiro(k), k)
+        g = zeros(k)
+        rev_gradient!(g, f, x, ReverseWorkspace(k))
+        @test g ≈ ForwardDiff.gradient(f, x) rtol=1e-9
+    end
+
+    # A workspace carries the side table too; reuse must not leave it stale.
+    rng = Xoshiro(7); X = randn(rng, 30, 6); yv = randn(rng, 30)
+    f = b -> sum(abs2, yv .- X*b)
+    x = randn(Xoshiro(2), 6)
+    ws = ReverseWorkspace(6)
+    g1 = zeros(6); rev_gradient!(g1, f, x, ws)
+    for _ in 1:5
+        g2 = zeros(6); rev_gradient!(g2, f, x, ws)
+        @test g2 == g1
+    end
+    @test g1 ≈ ForwardDiff.gradient(f, x) rtol=1e-9
+
+    # The node count must scale with N and NOT with N*K. Asserted by holding N
+    # fixed and varying K: if the elementwise path comes back, the count grows
+    # with K. This caught a real dispatch bug — LinearAlgebra's
+    # `*(::StridedMatrix{Float64}, ::StridedVector{S<:Real})` is more specific
+    # than a plain `AbstractVector{TapedReal}` signature, so it silently won and
+    # the array-level rule never fired, with no error to notice.
+    counts = map((5, 20, 80)) do kk
+        Xb = randn(Xoshiro(4), 100, kk); yb = randn(Xoshiro(5), 100)
+        fb = b -> sum(abs2, yb .- Xb*b)
+        wsb = ReverseWorkspace(kk)
+        gb = zeros(kk); rev_gradient!(gb, fb, randn(Xoshiro(6), kk), wsb)
+        @test gb ≈ ForwardDiff.gradient(fb, randn(Xoshiro(6), kk)) rtol=1e-9
+        length(wsb.tape)
+    end
+    # 16x more parameters must not mean materially more nodes
+    @test counts[3] < 2 * counts[1]
+end
