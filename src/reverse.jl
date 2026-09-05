@@ -653,6 +653,30 @@ Base.isnan(x::TapedReal) = isnan(x.v)
 Base.isinf(x::TapedReal) = isinf(x.v)
 Base.isfinite(x::TapedReal) = isfinite(x.v)
 Base.isinteger(x::TapedReal) = isinteger(x.v)
+# Asked of the TYPE by some Distributions paths (BernoulliLogit's logpdf
+# reaches it via logistic/log1pexp). A property of the stored float.
+Base.precision(::Type{TapedReal}) = precision(Float64)
+Base.precision(x::TapedReal) = precision(Float64)
+# `nextfloat`/`prevfloat` step to the adjacent representable value -- a guard
+# against landing exactly on a boundary (BernoulliLogit's logpdf uses them).
+# The step is infinitesimal, so the derivative is unchanged: only the primal
+# moves. Returning the value with its partials intact is the right answer;
+# treating it as a constant would silently zero a gradient.
+@inline Base.nextfloat(x::TapedReal) = TapedReal(x.tape, x.idx, nextfloat(x.v))
+@inline Base.prevfloat(x::TapedReal) = TapedReal(x.tape, x.idx, prevfloat(x.v))
+@inline Base.eps(::Type{TapedReal}) = eps(Float64)
+# Float introspection, all answering about the primal -- see the matching block
+# in Piste.jl. Queries, not operations, so nothing is recorded.
+@inline Base.exponent(x::TapedReal) = exponent(x.v)
+@inline Base.significand(x::TapedReal) = significand(x.v)
+@inline Base.frexp(x::TapedReal) = frexp(x.v)
+@inline Base.signbit(x::TapedReal) = signbit(x.v)
+@inline Base.sign(x::TapedReal) = sign(x.v)
+@inline Base.issubnormal(x::TapedReal) = issubnormal(x.v)
+@inline Base.decompose(x::TapedReal) = Base.decompose(x.v)
+# ldexp scales by a power of two, so the partials scale identically.
+@inline Base.ldexp(x::TapedReal, e::Integer) =
+    record!(x.tape, OP_MULC, x.idx, Int32(0), ldexp(x.v, e), ldexp(1.0, e))
 Base.round(x::TapedReal) = round(x.v)
 Base.floor(x::TapedReal) = floor(x.v)
 Base.ceil(x::TapedReal) = ceil(x.v)
@@ -804,13 +828,13 @@ ws = ReverseWorkspace(length(x))
 rev_gradient!(g, f, x, ws)
 ```
 """
-function rev_gradient!(g::Vector{Float64}, f::F, x::Vector{Float64},
+function rev_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real},
                        ws::ReverseWorkspace) where {F}
     v, _ = rev_value_and_gradient!(g, f, x, ws)
     return g
 end
 
-rev_gradient!(g::Vector{Float64}, f::F, x::Vector{Float64}) where {F} =
+rev_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real}) where {F} =
     rev_gradient!(g, f, x, ReverseWorkspace(length(x)))
 
 """
@@ -819,27 +843,33 @@ rev_gradient!(g::Vector{Float64}, f::F, x::Vector{Float64}) where {F} =
 As [`rev_gradient!`](@ref), also returning the primal — which the forward sweep
 has already computed, so it costs nothing extra.
 """
-function rev_value_and_gradient!(g::Vector{Float64}, f::F, x::Vector{Float64},
+# `g` and `x` are only required to be real vectors, not Float64 ones:
+# PracticalBayes is Float32-first, so a Float32 theta has to work. The TAPE
+# stays Float64 -- that is where the primals and partials live, and running the
+# recording in reduced precision would cost accuracy for no benefit, since the
+# tape is not the thing being stored in the model's parameter vector. Only the
+# interface converts, so `eltype(g)` is preserved exactly.
+function rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real},
                                  ws::ReverseWorkspace) where {F}
     K = length(x)
     length(ws.xs) < K && resize!(ws.xs, K)
     t = reset!(ws.tape)
     @inbounds for i in 1:K
-        ws.xs[i] = track!(t, x[i])
+        ws.xs[i] = track!(t, Float64(x[i]))
     end
     y = f(view(ws.xs, 1:K))
     if y isa TapedReal
         backward!(ws.adj, t, y.idx)
         @inbounds for i in 1:K
-            g[i] = ws.adj[ws.xs[i].idx]
+            g[i] = convert(eltype(g), ws.adj[ws.xs[i].idx])
         end
-        return (y.v, g)
+        return (convert(eltype(g), y.v), g)
     end
     # `f` returned something untracked, i.e. it does not actually depend on `x`.
     # A zero gradient is the right answer, and saying so beats a confusing error.
-    fill!(g, 0.0)
-    return (Float64(y), g)
+    fill!(g, zero(eltype(g)))
+    return (convert(eltype(g), y), g)
 end
 
-rev_value_and_gradient!(g::Vector{Float64}, f::F, x::Vector{Float64}) where {F} =
+rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real}) where {F} =
     rev_value_and_gradient!(g, f, x, ReverseWorkspace(length(x)))

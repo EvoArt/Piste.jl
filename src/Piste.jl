@@ -356,6 +356,33 @@ Base.isfinite(x::Dual) = isfinite(x.v)
 # value during their support check. Predicates like this always answer about
 # the value; a derivative has no bearing on whether a number is an integer.
 Base.isinteger(x::Dual) = isinteger(x.v)
+# `precision` is asked of the TYPE by some Distributions paths (BernoulliLogit's
+# logpdf reaches it via logistic/log1pexp), and it is a property of the
+# underlying float, not of the derivative.
+Base.precision(::Type{Dual{N,T}}) where {N,T} = precision(T)
+Base.precision(x::Dual{N,T}) where {N,T} = precision(T)
+# `nextfloat`/`prevfloat` step to the adjacent representable value -- a guard
+# against landing exactly on a boundary (BernoulliLogit's logpdf uses them).
+# The step is infinitesimal, so the derivative is unchanged: only the primal
+# moves. Returning the value with its partials intact is the right answer;
+# treating it as a constant would silently zero a gradient.
+@inline Base.nextfloat(x::Dual{N,T}) where {N,T} = Dual{N,T}(nextfloat(x.v), x.p)
+@inline Base.prevfloat(x::Dual{N,T}) where {N,T} = Dual{N,T}(prevfloat(x.v), x.p)
+@inline Base.eps(::Type{Dual{N,T}}) where {N,T} = eps(T)
+# Float INTROSPECTION, all answering about the primal. `BernoulliLogit`'s
+# logpdf reaches these through `log1pexp`'s branch selection. They describe the
+# floating-point representation, not the function being differentiated, so a
+# derivative does not enter -- and they are queries, not operations, so nothing
+# is recorded.
+@inline Base.exponent(x::Dual) = exponent(x.v)
+@inline Base.significand(x::Dual) = significand(x.v)
+@inline Base.frexp(x::Dual) = frexp(x.v)
+@inline Base.ldexp(x::Dual{N,T}, e::Integer) where {N,T} =
+    Dual{N,T}(ldexp(x.v, e), ntuple(i -> ldexp(x.p[i], e), Val(N)))
+@inline Base.signbit(x::Dual) = signbit(x.v)
+@inline Base.sign(x::Dual) = sign(x.v)
+@inline Base.issubnormal(x::Dual) = issubnormal(x.v)
+@inline Base.decompose(x::Dual) = Base.decompose(x.v)
 Base.round(x::Dual) = round(x.v)
 Base.floor(x::Dual) = floor(x.v)
 Base.ceil(x::Dual) = ceil(x.v)
