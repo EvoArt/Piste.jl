@@ -1,0 +1,6 @@
+[deps]
+Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Piste = "f69a1a94-130c-4fa4-b8d2-e36d656cbe66"
+
+[compat]
+Documenter = "1"

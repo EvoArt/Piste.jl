@@ -28,3 +28,18 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
 
       - uses: julia-actions/julia-runtest@v1
+
+      # Coverage, per the standard Julia package setup:
+      # https://modernjuliaworkflows.org/sharing/
+      # Only uploaded from ONE matrix cell -- Codecov merges multiple uploads
+      # per commit, and four near-identical reports add noise without adding
+      # information.
+      - uses: julia-actions/julia-processcoverage@v1
+        if: matrix.julia-version == '1' && matrix.os == 'ubuntu-latest'
+
+      - uses: codecov/codecov-action@v4
+        if: matrix.julia-version == '1' && matrix.os == 'ubuntu-latest'
+        with:
+          files: lcov.info
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false

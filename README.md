@@ -1,6 +1,11 @@
 # Piste.jl
 
-Forward-mode automatic differentiation that survives `juliac --trim`.
+[![CI](https://github.com/EvoArt/Piste.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/EvoArt/Piste.jl/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/EvoArt/Piste.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/EvoArt/Piste.jl)
+[![docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://EvoArt.github.io/Piste.jl/dev/)
+
+Forward- and reverse-mode automatic differentiation that survives
+`juliac --trim`.
 
 Gradients, from code slim enough to compile into a standalone binary. Not just
 any slope. A nicely groomed piste.
@@ -35,6 +40,26 @@ end
 At K=200 on a Rosenbrock objective this is within ~10% of ForwardDiff at matched
 chunk width, and faster than it at widths above 48. See `PERFORMANCE_NOTES.md`.
 
-Under `--trim`, pass a literal `Val(N)` rather than `pickchunk(K)`: the trimmer
-needs the width statically known, which is why it is a type parameter.
+## Reverse mode
+
+Forward mode costs `ceil(K/N)` passes, so it loses badly as `K` grows. Reverse
+mode costs one sweep regardless:
+
+```julia
+ws = ReverseWorkspace(length(x))
+rev_gradient!(g, f, x, ws)
+v, g = rev_value_and_gradient!(g, f, x, ws)
+```
+
+Use reverse for parameter-heavy models, forward for small ones.
+
+## Trimming
+
+Pass a literal `Val(N)` rather than `pickchunk(K)`: the trimmer needs the width
+statically known, which is why it is a type parameter.
+
+Every established AD package fails under `--trim`, because each builds its
+derivative at runtime in some form the trimmer cannot see -- a config, a thunk,
+an interpreter. Piste has no tag, no config, and a chunk width fixed as a type
+parameter, so the derivative is ordinary compiled Julia.
 

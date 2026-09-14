@@ -265,8 +265,20 @@ end
         ws = GradientWorkspace(x, Val(16))
         gradient!(g, _rosen, x, Val(16), ws)          # warm up / compile
         @test (@allocated gradient!(g, _rosen, x, Val(16), ws)) == 0
+
+        # `value_and_gradient!` returns `(value, g)`, and on Julia 1.10 that
+        # tuple is not elided -- it allocates 32 bytes there while being free on
+        # 1.11+. That is a compiler difference, not the driver allocating: the
+        # in-place `gradient!` above is 0 on every version, and the workspace is
+        # doing its job in both cases.
+        #
+        # Asserting 0 unconditionally made CI red on 1.10 for something no
+        # amount of package-side work can fix, so the bound is version-dependent
+        # and still tight enough to catch a real regression (a per-call buffer
+        # would be thousands of bytes, not 32).
         value_and_gradient!(g, _rosen, x, Val(16), ws)
-        @test (@allocated value_and_gradient!(g, _rosen, x, Val(16), ws)) == 0
+        vg_alloc = @allocated value_and_gradient!(g, _rosen, x, Val(16), ws)
+        @test vg_alloc <= (VERSION < v"1.11" ? 32 : 0)
     end
 
     @testset "value_and_gradient! with a workspace" begin
