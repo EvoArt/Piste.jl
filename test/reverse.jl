@@ -261,3 +261,134 @@ end
     # 16x more parameters must not mean materially more nodes
     @test counts[3] < 2 * counts[1]
 end
+
+@testset "reverse: matvec rows with zero adjoint (regression)" begin
+    # The matvec adjoint is DEFERRED: the sweep records each row's adjoint into
+    # a per-matrix accumulator and applies `X' * acc` once at the end. That
+    # accumulator is also borrowed as scratch for the forward primal, and the
+    # sweep SKIPS nodes whose adjoint is zero -- so a row the output does not
+    # depend on never overwrites its borrowed primal. Unless the accumulator is
+    # re-zeroed first, that leftover primal is flushed as if it were a gradient
+    # contribution: a silently wrong answer, with no error raised.
+    #
+    # Every objective here uses only SOME rows of `X * b`, so the rest keep a
+    # zero adjoint and the bug, if reintroduced, shows up as a wrong gradient.
+    rng = Xoshiro(11)
+    X = randn(rng, 40, 5)
+    x = randn(Xoshiro(12), 5)
+    for f in (b -> sum(abs2, (X*b)[1:3]),        # a leading slice
+              b -> (X*b)[1],                      # exactly one row
+              b -> (X*b)[end],                    # exactly one row, at the end
+              b -> sum(abs2, (X*b)[2:2:end]))     # every other row
+        g = zeros(5)
+        rev_gradient!(g, f, x, ReverseWorkspace(5))
+        @test g ≈ ForwardDiff.gradient(f, x) rtol=1e-9
+    end
+
+    # The same workspace reused across DIFFERENT objectives: the second call's
+    # zero-adjoint rows must not pick up the first call's values either.
+    ws = ReverseWorkspace(5)
+    f1 = b -> sum(abs2, X*b)
+    f2 = b -> sum(abs2, (X*b)[1:3])
+    g1 = zeros(5); rev_gradient!(g1, f1, x, ws)
+    g2 = zeros(5); rev_gradient!(g2, f2, x, ws)
+    @test g2 ≈ ForwardDiff.gradient(f2, x) rtol=1e-9
+end
+
+@testset "reverse: logistic fusion (peephole)" begin
+    # `1/(1+exp(-u))` is collapsed from four nodes to one OP_LOGISTIC by a
+    # peephole that rewrites the tail of the tape. A peephole that fires when it
+    # should not gives a WRONG GRADIENT with no error, so this checks both the
+    # fused shape and every near-miss that must NOT fuse.
+    logistic(x) = 1 / (1 + exp(-x))
+
+    # The fused shape, over a range that covers both tails.
+    for x0 in (-8.0, -1.0, 0.0, 0.5, 3.0, 9.0)
+        f = v -> logistic(v[1])
+        g = zeros(1); rev_gradient!(g, f, [x0], ReverseWorkspace(1))
+        s = logistic(x0)
+        @test g[1] ≈ s * (1 - s) rtol=1e-10
+        @test g[1] ≈ ForwardDiff.gradient(f, [x0])[1] rtol=1e-10
+    end
+
+    # Fusion must not lose the chain rule through its argument.
+    f2 = v -> logistic(2.5 * v[1] + v[2] * v[2])
+    x2 = [0.4, -1.1]
+    g2 = zeros(2); rev_gradient!(g2, f2, x2, ReverseWorkspace(2))
+    @test g2 ≈ ForwardDiff.gradient(f2, x2) rtol=1e-10
+
+    # Near misses: each differs from the fused pattern in one way, so each must
+    # fall through to the unfused path and still be right.
+    nearmiss = [
+        v -> 2 / (1 + exp(-v[1])),        # numerator is not 1
+        v -> 1 / (2 + exp(-v[1])),        # addend is not 1
+        v -> 1 / (1 + exp(v[1])),         # argument is not negated
+        v -> 1 / (1 + exp(-v[1]) + 0.0*v[2]),  # extra node after the chain
+        v -> 1 / (1 - exp(-v[1])),        # minus, not plus
+        v -> 1 / (1 + 2*exp(-v[1])),      # scaled exponential
+    ]
+    xn = [0.7, 0.3]
+    for f in nearmiss
+        g = zeros(2); rev_gradient!(g, f, xn, ReverseWorkspace(2))
+        @test g ≈ ForwardDiff.gradient(f, xn) rtol=1e-9
+    end
+
+    # The fusion must actually fire -- otherwise the test above passes for the
+    # wrong reason and the speedup silently disappears.
+    ws = ReverseWorkspace(1)
+    g = zeros(1); rev_gradient!(g, v -> logistic(v[1]), [0.3], ws)
+    nfused = length(ws.tape)
+    rev_gradient!(g, v -> 1 / (2 + exp(-v[1])), [0.3], ws)
+    @test nfused < length(ws.tape)
+
+    # Reused inside a sequential loop, the shape the HMM likelihood has.
+    f3 = v -> begin
+        s = zero(eltype(v)); a = one(eltype(v))
+        for i in 1:5
+            p = 1 / (1 + exp(-(v[1] * i + v[2])))
+            a = a * p
+            s = s + log(a)
+        end
+        s
+    end
+    x3 = [0.25, -0.4]
+    g3 = zeros(2); rev_gradient!(g3, f3, x3, ReverseWorkspace(2))
+    @test g3 ≈ ForwardDiff.gradient(f3, x3) rtol=1e-9
+end
+
+@testset "reverse: matvec scratch is pooled, not reallocated" begin
+    # The array-level matvec keeps its primal and adjoint scratch in the tape's
+    # pooled accumulators, so neither grows with the number of ROWS once warm.
+    #
+    # This cannot assert zero: `X * b` returns a `Vector{TapedReal}` and the
+    # objective's own `yv .- (...)` allocates a broadcast result, both of which
+    # belong to the user's code rather than the tape. What it CAN assert is that
+    # the tape adds nothing on top -- a regression that reintroduces a per-call
+    # `mu` buffer (or stops pooling the accumulator) makes the total scale with
+    # N a second time, which is what the comparison below catches.
+    rng = Xoshiro(21)
+    X = randn(rng, 500, 20); yv = randn(rng, 500)
+    f = b -> sum(abs2, yv .- X*b)
+    x = randn(Xoshiro(22), 20)
+    g = zeros(20); ws = ReverseWorkspace(20)
+    rev_gradient!(g, f, x, ws)          # warm: sizes the pooled buffers
+    rev_gradient!(g, f, x, ws)
+    a = @allocated rev_gradient!(g, f, x, ws)
+
+    # The unavoidable part: one Vector{TapedReal} of length N (the matvec's
+    # output) plus one Vector{Float64} of length N (the broadcast). Anything
+    # much beyond that means scratch is being reallocated per call.
+    unavoidable = 500 * sizeof(TapedReal) + 500 * sizeof(Float64)
+    @test a < 2 * unavoidable
+
+    # The decisive check: DOUBLE the rows. The per-call cost must grow by only
+    # the two user-visible arrays above, not by a third buffer of the tape's
+    # own. If the pooled accumulator were reallocated per call this ratio would
+    # be visibly larger than the array-size ratio.
+    X2 = randn(Xoshiro(23), 1000, 20); yv2 = randn(Xoshiro(24), 1000)
+    f2 = b -> sum(abs2, yv2 .- X2*b)
+    ws2 = ReverseWorkspace(20)
+    rev_gradient!(g, f2, x, ws2); rev_gradient!(g, f2, x, ws2)
+    a2 = @allocated rev_gradient!(g, f2, x, ws2)
+    @test a2 < 2.3 * a
+end
