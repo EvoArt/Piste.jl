@@ -146,12 +146,21 @@ mutable struct Tape
     #
     # It holds only plain data (the DATA matrix and the tracked inputs' tape
     # indices), never a closure, so nothing here costs trimmability.
-    # Concrete element type on purpose. A `Vector{AbstractMatrix}` boxes and
+    # Concrete element types on purpose. A `Vector{AbstractMatrix}` boxes and
     # dispatches on every access in the reverse sweep -- measured, it made the
-    # sweep slower and allocations higher than storing a copy did. A data matrix
-    # is a `Matrix{Float64}` in practice; anything else converts once here
-    # rather than making the common path pay.
+    # sweep slower and allocations higher than storing a copy did.
+    #
+    # Hence two tables: `Matrix{Float64}` and `Matrix{Float32}` data are both
+    # stored by REFERENCE, each in its own concretely typed vector. Float32
+    # used to go through `convert(Matrix{Float64}, X)`, which copied the whole
+    # data matrix on every gradient call: a Float32 model ran 1.3-2.5x slower
+    # than the same model in Float64, the gap growing with N*K. Any other
+    # element type still converts into `mats`.
     mats::Vector{Matrix{Float64}}
+    mats32::Vector{Matrix{Float32}}
+    # Where matrix `m` lives: `mref[m] > 0` is an index into `mats`, `< 0`
+    # minus an index into `mats32`. `idxs` and `accs` stay indexed by `m`.
+    mref::Vector{Int32}
     idxs::Vector{UnitRange{Int32}}
     # Per-matrix DEFERRED adjoint accumulator, one entry per `mats` entry.
     #
@@ -167,7 +176,8 @@ mutable struct Tape
     accs::Vector{Vector{Float64}}
 end
 
-Tape() = Tape(Node[], 0, Matrix{Float64}[], UnitRange{Int32}[], Vector{Float64}[])
+Tape() = Tape(Node[], 0, Matrix{Float64}[], Matrix{Float32}[], Int32[],
+              UnitRange{Int32}[], Vector{Float64}[])
 
 """
     Tape(capacity::Int)
@@ -175,7 +185,8 @@ Tape() = Tape(Node[], 0, Matrix{Float64}[], UnitRange{Int32}[], Vector{Float64}[
 Preallocate for a known node count, so even the first sweep does not grow.
 """
 Tape(capacity::Integer) = Tape(Vector{Node}(undef, Int(capacity)), 0,
-                              Matrix{Float64}[], UnitRange{Int32}[], Vector{Float64}[])
+                              Matrix{Float64}[], Matrix{Float32}[], Int32[],
+                              UnitRange{Int32}[], Vector{Float64}[])
 
 """
     reset!(t) -> t
@@ -186,6 +197,8 @@ memory. This is what makes repeated gradient calls cheap.
 @inline function reset!(t::Tape)
     t.n = 0
     empty!(t.mats)
+    empty!(t.mats32)
+    empty!(t.mref)
     empty!(t.idxs)
     # `accs` keeps its buffers: they are pooled by position and re-zeroed when
     # claimed in `_claim_acc!`, so repeated sweeps of the same model reuse the
@@ -646,17 +659,11 @@ function _matvec_taped(X::AbstractMatrix{<:Real}, b::AbstractVector{TapedReal})
     # the reverse sweep, so a reference is sufficient; the caller must not
     # mutate their data between the forward and reverse passes, which is the
     # same contract every AD package assumes.
-    # No copy when it is already the concrete type -- `convert` is the identity
-    # there. `Matrix{Float64}(X)` unconditionally copied the whole data matrix
-    # on every gradient call, which profiling put at 62% of runtime (memmove
-    # 42.2%, GenericMemory 19.6% and GC-flagged). The matrix is only read during
-    # the reverse sweep, so sharing it is safe; the caller must not mutate their
-    # data between the forward and reverse passes, which is the contract every
-    # AD package assumes.
-    Xm = convert(Matrix{Float64}, X)
-    push!(t.mats, Xm)
+    #
+    # Float64 and Float32 matrices are both kept as they are (see `Tape.mats32`);
+    # only other element types are converted, and so copied.
     push!(t.idxs, lo:hi)
-    m = Int(length(t.mats))
+    m = length(t.idxs)
     _claim_acc!(t, m, n)
 
     # The PRIMAL is computed COLUMN-MAJOR, not as `n` row dot products.
@@ -676,7 +683,16 @@ function _matvec_taped(X::AbstractMatrix{<:Real}, b::AbstractVector{TapedReal})
     # zero-adjoint nodes and would otherwise flush a leftover primal as a
     # gradient contribution.
     mu = t.accs[m]
-    _matvec_primal!(mu, Xm, b)
+    if X isa Matrix{Float32}
+        push!(t.mats32, X)
+        push!(t.mref, -Int32(length(t.mats32)))
+        _matvec_primal!(mu, X, b)
+    else
+        Xm = convert(Matrix{Float64}, X)
+        push!(t.mats, Xm)
+        push!(t.mref, Int32(length(t.mats)))
+        _matvec_primal!(mu, Xm, b)
+    end
     out = Vector{TapedReal}(undef, n)
     @inbounds for i in 1:n
         # `c` carries the side-table slot, `d` the row -- both as Float64, which
@@ -689,8 +705,8 @@ end
 # `X * b` over the primal values, accumulated down each column so every inner
 # loop is unit stride. Plain Julia, so nothing here costs trimmability.
 # In-place into a caller-owned buffer, so repeated sweeps allocate nothing.
-function _matvec_primal!(mu::Vector{Float64}, Xm::Matrix{Float64},
-                         b::AbstractVector{TapedReal})
+function _matvec_primal!(mu::Vector{Float64}, Xm::Matrix{T},
+                         b::AbstractVector{TapedReal}) where {T<:Union{Float64,Float32}}
     n, k = size(Xm)
     @inbounds for i in 1:n
         mu[i] = 0.0
@@ -699,7 +715,7 @@ function _matvec_primal!(mu::Vector{Float64}, Xm::Matrix{Float64},
         bj = b[j].v
         bj == 0.0 && continue
         @simd for i in 1:n
-            mu[i] = muladd(Xm[i, j], bj, mu[i])
+            mu[i] = muladd(Float64(Xm[i, j]), bj, mu[i])
         end
     end
     return mu
@@ -739,13 +755,13 @@ end
 # a row of X per node -- across the stride of a column-major array -- and was
 # measured at 1258 us against 373 us for this column-major form on a 5000x200
 # problem. Each column is one unit-stride dot product that vectorises.
-function _flush_matvec!(adj::Vector{Float64}, Xm::Matrix{Float64},
-                        acc::Vector{Float64}, base::Int, k::Int)
+function _flush_matvec!(adj::Vector{Float64}, Xm::Matrix{T},
+                        acc::Vector{Float64}, base::Int, k::Int) where {T<:Union{Float64,Float32}}
     n = size(Xm, 1)
     @inbounds for j in 1:k
         s = 0.0
         @simd for i in 1:n
-            s = muladd(Xm[i, j], acc[i], s)
+            s = muladd(Float64(Xm[i, j]), acc[i], s)
         end
         adj[base + j - 1] += s
     end
@@ -889,14 +905,13 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
     # below skips any node whose adjoint is zero (`ai == 0.0 && continue`), so a
     # skipped row would otherwise keep its PRIMAL and be flushed as though it
     # were an adjoint -- a silently wrong gradient, not a crash.
-    @inbounds for m in 1:length(t.mats)
+    @inbounds for m in 1:length(t.mref)
         a = t.accs[m]
         for i in 1:length(a)
             a[i] = 0.0
         end
     end
     nodes = t.nodes
-    mats = t.mats
     accs = t.accs
     @inbounds for i in n:-1:1
         ai = adj[i]
@@ -980,10 +995,17 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
     # stops there, so nothing downstream reads `adj[base:base+k-1]` again. A
     # matvec over a COMPUTED vector would break that assumption, which is why
     # `_matvec_taped` re-records non-contiguous operands as leaves first.
-    @inbounds for m in 1:length(mats)
+    # `mref` says which typed table holds matrix `m`; each branch calls the
+    # kernel on a concrete matrix type, so there is no dynamic dispatch here.
+    @inbounds for m in 1:length(t.mref)
         r = t.idxs[m]
-        _flush_matvec!(adj, mats[m], accs[m], Int(first(r)),
-                       Int(last(r)) - Int(first(r)) + 1)
+        base = Int(first(r)); k = Int(last(r)) - base + 1
+        j = t.mref[m]
+        if j > 0
+            _flush_matvec!(adj, t.mats[j], accs[m], base, k)
+        else
+            _flush_matvec!(adj, t.mats32[-j], accs[m], base, k)
+        end
     end
     return adj
 end

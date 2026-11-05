@@ -392,3 +392,36 @@ end
     a2 = @allocated rev_gradient!(g, f2, x, ws2)
     @test a2 < 2.3 * a
 end
+
+@testset "reverse: Float32 data matrix is not copied (regression)" begin
+    # A `Matrix{Float32}` used to be converted to `Matrix{Float64}` on every
+    # gradient call, copying all of X, so a Float32 model ran 1.3-2.5x slower
+    # than the same model in Float64. It is now kept by reference in its own
+    # side table; the answer must match the Float64 path, which the testsets
+    # above already check against ForwardDiff.
+    rng = Xoshiro(31)
+    X32 = randn(rng, Float32, 500, 40); X64 = Float64.(X32)
+    yv = randn(rng, 500)
+    x = randn(Xoshiro(32), 40)
+    g32 = zeros(40); g64 = zeros(40)
+    f32 = b -> sum(abs2, yv .- X32*b) + sum(exp, b)/10
+    f64 = b -> sum(abs2, yv .- X64*b) + sum(exp, b)/10
+    ws32 = ReverseWorkspace(40); ws64 = ReverseWorkspace(40)
+    rev_gradient!(g32, f32, x, ws32); rev_gradient!(g64, f64, x, ws64)
+    @test g32 ≈ g64 rtol=1e-12
+
+    # Both a Float32 and a Float64 matrix in one objective, so the two side
+    # tables are used in the same sweep.
+    fmix = b -> sum(abs2, yv .- X32*b) + sum(abs2, X64*b) / 7
+    fref = b -> sum(abs2, yv .- X64*b) + sum(abs2, X64*b) / 7
+    gm = zeros(40); gr = zeros(40)
+    rev_gradient!(gm, fmix, x, ReverseWorkspace(40))
+    rev_gradient!(gr, fref, x, ReverseWorkspace(40))
+    @test gm ≈ gr rtol=1e-12
+
+    # No per-call copy: the same allocation budget as the pooling test above.
+    # A copy of X would add 500*40*8 = 160 kB, several times this bound.
+    rev_gradient!(g32, f32, x, ws32)
+    a = @allocated rev_gradient!(g32, f32, x, ws32)
+    @test a < 2 * (500 * sizeof(TapedReal) + 500 * sizeof(Float64))
+end
