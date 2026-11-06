@@ -67,10 +67,12 @@ Piste forward uses `pickchunk(K)` with a `GradientWorkspace`. Piste reverse uses
 
 Forward mode, from Piste or ForwardDiff, is competitive only while P is small.
 At P=200 the reverse-mode backends are one to two orders of magnitude faster.
-With few parameters and many observations, Piste forward is level with or ahead
-of everything else on the Poisson and logistic models. With many of both, Piste
-reverse is the fastest backend on those two models. Enzyme is the fastest
-backend on the normal model, where Piste reverse is well behind when P is small.
+With few parameters, Piste forward is level with or ahead of everything else on
+the Poisson and logistic models. With many parameters, Piste reverse is the
+fastest backend on those two models whenever there are many observations, and
+in `Float64` with few observations too. Enzyme is the fastest backend on the
+normal model (ForwardDiff edges it in the smallest cell). There Piste reverse is
+1.3-1.7x behind Enzyme at P=200, and 2.4-7x behind when P is small.
 Piste is the only backend in these tables that survives `juliac --trim`.
 
 The timings come from PracticalBayes' benchmark sweep. The corner cells of its
@@ -79,41 +81,41 @@ The timings come from PracticalBayes' benchmark sweep. The corner cells of its
 these tables from its output.
 
 <!-- BENCH:START -->
-Measured with Julia 1.12.7 on one Julia thread and 1 BLAS thread of an exclusive Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz node: Piste 0.3.0 (003fd5d), ForwardDiff 1.4.7, Mooncake 0.5.67, Enzyme 0.13.216. Each figure is the median of up to 200 samples or 3 s.
+Measured with Julia 1.12.7 on one Julia thread and 1 BLAS thread of an exclusive Intel(R) Xeon(R) Silver 4216 CPU @ 2.10GHz node: Piste 0.3.0 (92b011b), ForwardDiff 1.4.7, Mooncake 0.5.67, Enzyme 0.13.216. Each figure is the median of up to 200 samples or 3 s.
 
 ### Float64
 
 | Model | N | P | Piste fwd | Piste rev | ForwardDiff | Mooncake | Enzyme |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `normal` | 50 | 2 | 1.49 µs | 3.85 µs | **968 ns** | 2.55 µs | 1.04 µs |
-| `normal` | 50 | 200 | 532 µs | 17.5 µs | 1.71 ms | 32.3 µs | **9.75 µs** |
-| `normal` | 20000 | 2 | 448 µs | 1.08 ms | 320 µs | 262 µs | **144 µs** |
-| `normal` | 20000 | 200 | 370 ms | 5.58 ms | 614 ms | 14.3 ms | **3.92 ms** |
-| `poisson` | 50 | 2 | 4.23 µs | 5.53 µs | 4.26 µs | 13.3 µs | **3.89 µs** |
-| `poisson` | 50 | 200 | 577 µs | **19.5 µs** | 1.77 ms | 43.1 µs | 20.5 µs |
-| `poisson` | 20000 | 2 | 1.15 ms | 1.88 ms | **1.13 ms** | 2.87 ms | 1.24 ms |
-| `poisson` | 20000 | 200 | 386 ms | **8.55 ms** | 630 ms | 19.6 ms | 12.8 ms |
-| `bernoulli_logit` | 50 | 2 | 4.38 µs | 6.50 µs | **3.61 µs** | 14.8 µs | 5.74 µs |
-| `bernoulli_logit` | 50 | 200 | 577 µs | 20.3 µs | 1.82 ms | 42.8 µs | **16.8 µs** |
-| `bernoulli_logit` | 20000 | 2 | **1.20 ms** | 2.29 ms | 1.31 ms | 3.68 ms | 1.25 ms |
-| `bernoulli_logit` | 20000 | 200 | 370 ms | **7.84 ms** | 626 ms | 17.8 ms | 11.0 ms |
+| `normal` | 50 | 2 | 1.39 µs | 2.53 µs | **957 ns** | 2.56 µs | 1.01 µs |
+| `normal` | 50 | 200 | 535 µs | 11.4 µs | 1.69 ms | 32.5 µs | **8.39 µs** |
+| `normal` | 20000 | 2 | 448 µs | 486 µs | 401 µs | 265 µs | **153 µs** |
+| `normal` | 20000 | 200 | 366 ms | 5.34 ms | 616 ms | 19.1 ms | **4.20 ms** |
+| `poisson` | 50 | 2 | **3.03 µs** | 5.25 µs | 4.33 µs | 14.1 µs | 3.86 µs |
+| `poisson` | 50 | 200 | 574 µs | **15.3 µs** | 1.82 ms | 43.2 µs | 20.2 µs |
+| `poisson` | 20000 | 2 | 1.15 ms | 1.80 ms | **1.14 ms** | 2.82 ms | 1.21 ms |
+| `poisson` | 20000 | 200 | 373 ms | **6.60 ms** | 622 ms | 19.2 ms | 11.0 ms |
+| `bernoulli_logit` | 50 | 2 | **3.23 µs** | 5.96 µs | 3.67 µs | 14.3 µs | 5.75 µs |
+| `bernoulli_logit` | 50 | 200 | 588 µs | **15.4 µs** | 1.79 ms | 43.0 µs | 20.1 µs |
+| `bernoulli_logit` | 20000 | 2 | **1.22 ms** | 2.12 ms | 1.37 ms | 3.63 ms | 1.83 ms |
+| `bernoulli_logit` | 20000 | 200 | 369 ms | **7.62 ms** | 623 ms | 17.8 ms | 11.3 ms |
 
 ### Float32
 
 | Model | N | P | Piste fwd | Piste rev | ForwardDiff | Mooncake | Enzyme |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| `normal` | 50 | 2 | 2.53 µs | 3.92 µs | 1.67 µs | 2.07 µs | **1.43 µs** |
-| `normal` | 50 | 200 | 429 µs | 18.3 µs | 2.29 ms | 20.8 µs | **8.41 µs** |
-| `normal` | 20000 | 2 | 249 µs | 1.06 ms | 146 µs | 232 µs | **66.8 µs** |
-| `normal` | 20000 | 200 | 179 ms | 3.31 ms | 601 ms | 6.76 ms | **1.49 ms** |
-| `poisson` | 50 | 2 | 3.57 µs | 5.53 µs | 3.59 µs | 8.09 µs | **3.31 µs** |
-| `poisson` | 50 | 200 | 439 µs | 20.0 µs | 2.34 ms | 27.1 µs | **10.4 µs** |
-| `poisson` | 20000 | 2 | **1.10 ms** | 1.86 ms | 1.10 ms | 2.86 ms | 1.30 ms |
-| `poisson` | 20000 | 200 | 182 ms | **4.21 ms** | 609 ms | 9.80 ms | 5.10 ms |
-| `bernoulli_logit` | 50 | 2 | **3.66 µs** | 7.43 µs | 4.12 µs | 8.62 µs | 5.43 µs |
-| `bernoulli_logit` | 50 | 200 | 450 µs | 20.6 µs | 2.32 ms | 25.3 µs | **10.6 µs** |
-| `bernoulli_logit` | 20000 | 2 | **1.19 ms** | 2.25 ms | 1.30 ms | 2.96 ms | 1.38 ms |
-| `bernoulli_logit` | 20000 | 200 | 184 ms | **4.46 ms** | 610 ms | 9.59 ms | 5.02 ms |
+| `normal` | 50 | 2 | 2.51 µs | 2.49 µs | 1.65 µs | 2.10 µs | **1.04 µs** |
+| `normal` | 50 | 200 | 429 µs | 12.4 µs | 2.31 ms | 28.1 µs | **8.34 µs** |
+| `normal` | 20000 | 2 | 254 µs | 502 µs | 148 µs | 234 µs | **69.7 µs** |
+| `normal` | 20000 | 200 | 185 ms | 2.76 ms | 601 ms | 7.01 ms | **1.61 ms** |
+| `poisson` | 50 | 2 | 3.57 µs | 5.19 µs | 3.59 µs | 8.53 µs | **3.40 µs** |
+| `poisson` | 50 | 200 | 438 µs | 14.6 µs | 2.32 ms | 27.9 µs | **11.5 µs** |
+| `poisson` | 20000 | 2 | 1.10 ms | 1.79 ms | **1.10 ms** | 2.75 ms | 1.37 ms |
+| `poisson` | 20000 | 200 | 187 ms | **3.99 ms** | 609 ms | 9.90 ms | 5.15 ms |
+| `bernoulli_logit` | 50 | 2 | **3.68 µs** | 5.29 µs | 4.59 µs | 8.36 µs | 5.42 µs |
+| `bernoulli_logit` | 50 | 200 | 443 µs | 17.9 µs | 2.39 ms | 25.4 µs | **10.4 µs** |
+| `bernoulli_logit` | 20000 | 2 | **1.20 ms** | 2.12 ms | 1.30 ms | 3.24 ms | 1.39 ms |
+| `bernoulli_logit` | 20000 | 200 | 188 ms | **4.63 ms** | 611 ms | 10.0 ms | 5.24 ms |
 <!-- BENCH:END -->
 
 ## Trimming
