@@ -14,6 +14,7 @@ using Piste: Dual, value, partials, gradient!, value_and_gradient!
 using Piste: GradientWorkspace, pickchunk
 using Piste: TapedReal, Tape, ReverseWorkspace, track!, reset!, rev_gradient!, rev_value_and_gradient!
 import SpecialFunctions
+import LogExpFunctions          # activates ext/PisteLogExpFunctionsExt.jl
 using Test
 using Distributions
 using LinearAlgebra: I, Diagonal

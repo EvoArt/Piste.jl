@@ -334,12 +334,13 @@ end
     end
 
     # The fusion must actually fire -- otherwise the test above passes for the
-    # wrong reason and the speedup silently disappears.
+    # wrong reason and the speedup silently disappears. The chain below it stays
+    # on the tape (see the reuse regression below), so check the output node's op.
     ws = ReverseWorkspace(1)
     g = zeros(1); rev_gradient!(g, v -> logistic(v[1]), [0.3], ws)
-    nfused = length(ws.tape)
+    @test ws.tape.nodes[length(ws.tape)].op == Piste.OP_LOGISTIC
     rev_gradient!(g, v -> 1 / (2 + exp(-v[1])), [0.3], ws)
-    @test nfused < length(ws.tape)
+    @test ws.tape.nodes[length(ws.tape)].op != Piste.OP_LOGISTIC
 
     # Reused inside a sequential loop, the shape the HMM likelihood has.
     f3 = v -> begin
@@ -354,6 +355,184 @@ end
     x3 = [0.25, -0.4]
     g3 = zeros(2); rev_gradient!(g3, f3, x3, ReverseWorkspace(2))
     @test g3 ≈ ForwardDiff.gradient(f3, x3) rtol=1e-9
+end
+
+@testset "reverse: fused intermediates stay valid when reused (regression)" begin
+    # Both peepholes used to DROP the nodes they fused and reuse their tape
+    # slots. A value the caller still held then pointed at the fused node, and
+    # the gradient came back wrong with no error: 4.0 instead of 1.0 for the
+    # first case below, +0.244 instead of -0.496 for the second.
+    fs = [
+        v -> (p = v[1] * 2.0; s = v[2] + p; s + p * 3.0),           # s + x*c, then x*c reused
+        v -> (p = v[1] * 2.0; s = p + v[2]; s * p),                 # operands swapped
+        v -> (e = exp(-v[1]); s = 1.0 / (1.0 + e); s + e * v[2]),   # exp(-u) reused after logistic
+        v -> (d = 1.0 + exp(-v[1]); s = 1.0 / d; s * d + v[2]),     # 1 + exp(-u) reused
+    ]
+    x = [0.3, 0.7]
+    for f in fs
+        g = zeros(2); rev_gradient!(g, f, x, ReverseWorkspace(2))
+        @test g ≈ ForwardDiff.gradient(f, x) rtol=1e-10
+    end
+end
+
+@testset "reverse: TapedReal is isbits and slots are returned" begin
+    # Arrays of TapedReal must be plain bits: a pointer field made every
+    # matvec output and broadcast a GC-scanned, write-barriered, zero-filled
+    # array, a third of gradient time on a normal regression.
+    @test isbitstype(TapedReal)
+    @test sizeof(TapedReal) == 16
+
+    # Each call borrows a slot and returns it. More calls than there are slots
+    # must therefore work, both normally and when `f` throws partway through.
+    f = v -> sum(abs2, v) + exp(v[1])
+    x = [0.3, -0.2]
+    g = zeros(2)
+    for _ in 1:(Piste._MAX_SLOTS + 10)
+        rev_gradient!(g, f, x)                 # a fresh workspace (and tape) per call
+    end
+    @test g ≈ ForwardDiff.gradient(f, x)
+    bad = v -> (v[1] > 0 ? error("boom") : v[1])
+    nthrown = 0
+    for _ in 1:(Piste._MAX_SLOTS + 10)
+        try
+            rev_gradient!(g, bad, [1.0])
+        catch e
+            e isa ErrorException && (nthrown += 1)
+        end
+    end
+    @test nthrown == Piste._MAX_SLOTS + 10
+    rev_gradient!(g, f, x)
+    @test g ≈ ForwardDiff.gradient(f, x)
+
+    # Concurrent gradients on separate workspaces each read only their own slot.
+    X = randn(Xoshiro(5), 60, 4); yv = randn(Xoshiro(6), 60)
+    h = b -> sum(abs2, yv .- X * b) + sum(exp, b)
+    xs = [randn(Xoshiro(i), 4) for i in 1:64]
+    out = [zeros(4) for _ in 1:64]
+    Threads.@threads for i in 1:64
+        rev_gradient!(out[i], h, xs[i], ReverseWorkspace(4))
+    end
+    @test all(out[i] ≈ ForwardDiff.gradient(h, xs[i]) for i in 1:64)
+
+    # A DETACHED result (idx 0) used to seed adj[0] under @inbounds.
+    g3 = ones(3)
+    v, _ = rev_value_and_gradient!(g3, z -> zero(eltype(z)) + 2.0, [1.0, 2.0, 3.0])
+    @test v == 2.0
+    @test g3 == zeros(3)
+end
+
+@testset "reverse: matvec over a COMPUTED vector (regression)" begin
+    # The deferred matvec adjoint used to be flushed after the whole sweep,
+    # which is only right when the operands are the raw parameters. Over any
+    # computed vector the gradient came back as exactly ZERO, silently:
+    # `X * (2 .* b)` gave [0, 0] for [-162.4, -208.0]. Every case here goes
+    # through that path.
+    X = randn(Xoshiro(21), 12, 4); X32 = Float32.(randn(Xoshiro(22), 12, 4))
+    Y = randn(Xoshiro(23), 12, 4); yv = randn(Xoshiro(24), 12)
+    fs = [
+        b -> sum(abs2, X * (2.0 .* b)),
+        b -> sum(abs2, yv .- X * b[end:-1:1]),                 # permuted
+        b -> sum(abs2, X * exp.(b)) + sum(b),                  # nonlinear
+        b -> (u = b .* b; sum(X * u) + sum(abs2, Y * u)),      # two matvecs, one operand
+        b -> sum(abs2, X * b) + sum(abs2, Y * (b .+ 1.0)),     # raw and computed
+        b -> sum(abs2, X32 * (0.5 .* b)) + sum(X * b),         # Float32 data
+        b -> (z = X * (b .* 3.0); sum(abs2, Y * (z[1:4] .- b))),  # matvec of a matvec
+    ]
+    x = [0.3, -0.7, 0.2, 1.1]
+    for f in fs
+        g = zeros(4); rev_gradient!(g, f, x, ReverseWorkspace(4))
+        @test g ≈ ForwardDiff.gradient(f, x) rtol=1e-6
+    end
+end
+
+@testset "reverse: matvec over a vector starting with a constant (regression)" begin
+    # [constant, x1, x2]: the tracked part is tape indices 1..2, so a span check
+    # that accepted index 0 as its start saw "contiguous 0:2" and the flush
+    # wrote adj[0].
+    X = [1.0 2.0 3.0; 4.0 5.0 6.0]
+    f = v -> sum(abs2, X * TapedReal[TapedReal(0.5), v[1], v[2]])
+    ref = v -> sum(abs2, X * [0.5, v[1], v[2]])
+    x = [0.3, -0.7]
+    g = zeros(2); rev_gradient!(g, f, x, ReverseWorkspace(2))
+    @test g ≈ ForwardDiff.gradient(ref, x) rtol=1e-12
+end
+
+@testset "reverse: array-level sum and sum(abs2)" begin
+    fs = [
+        v -> sum(v),
+        v -> sum(abs2, v),
+        v -> sum(abs2, [1.5, 2.0, 0.5] .- v),        # the normal log-density shape
+        v -> sum(v[[3, 1, 2]] .* 2.0) * v[1],         # operands not contiguous on the tape
+        v -> sum(abs2, reshape([v[1], v[2], v[3], v[1] * v[2]], 2, 2)),  # a matrix
+        v -> sum(abs2, v) * sum(v) + sum(abs2, v),    # reused, and two reductions
+    ]
+    x = [0.4, -1.3, 0.8]
+    for f in fs
+        g = zeros(3); rev_gradient!(g, f, x, ReverseWorkspace(3))
+        @test g ≈ ForwardDiff.gradient(f, x) rtol=1e-12
+        v, _ = rev_value_and_gradient!(g, f, x, ReverseWorkspace(3))
+        @test v ≈ f(x) rtol=1e-14
+    end
+    # A detached (constant) entry inside the array. These build TapedReal
+    # arrays explicitly, which ForwardDiff cannot run, so each has a plain twin
+    # as the reference.
+    pairs = [
+        (v -> sum(TapedReal[v[1], TapedReal(2.0), v[3]]),          v -> v[1] + 2.0 + v[3]),
+        (v -> sum(abs2, TapedReal[TapedReal(3.0), v[2]]) + sum(abs2, v),
+         v -> 9.0 + v[2]^2 + sum(abs2, v)),
+    ]
+    for (f, ref) in pairs
+        g = zeros(3); v, _ = rev_value_and_gradient!(g, f, x, ReverseWorkspace(3))
+        @test g ≈ ForwardDiff.gradient(ref, x) rtol=1e-12
+        @test v ≈ ref(x) rtol=1e-14
+    end
+    # Empty and all-constant reductions have no tape and a zero gradient.
+    g = ones(3); rev_gradient!(g, v -> sum(v[1:0]) + v[1], x)
+    @test g == [1.0, 0.0, 0.0]
+
+    # One node for the whole reduction, not N-1 adds -- otherwise the tests above
+    # pass for the wrong reason and the speedup is gone.
+    ws = ReverseWorkspace(200)
+    xb = randn(Xoshiro(9), 200)
+    rev_gradient!(zeros(200), v -> sum(abs2, v), xb, ws)
+    @test length(ws.tape) == 201
+
+    # Workspace reuse across different reduction sizes.
+    for n in (5, 200, 3, 200)
+        f = v -> sum(abs2, v[1:n]) + sum(v[1:n])
+        g = zeros(200); rev_gradient!(g, f, xb, ws)
+        @test g ≈ ForwardDiff.gradient(f, xb) rtol=1e-12
+    end
+end
+
+@testset "reverse: LogExpFunctions rules (extension)" begin
+    LEF = LogExpFunctions
+    @test Base.get_extension(Piste, :PisteLogExpFunctionsExt) !== nothing
+    cases = [
+        (LEF.log1pexp, (-800.0, -50.0, -20.0, -1.0, 0.0, 1.0, 20.0, 35.0, 50.0)),
+        (LEF.logistic, (-50.0, -3.0, 0.0, 0.7, 40.0)),
+        (LEF.logit,    (1e-6, 0.2, 0.5, 0.9, 1 - 1e-6)),
+        (LEF.log1mexp, (-50.0, -2.0, -0.5, -1e-3)),
+        (LEF.logexpm1, (1e-3, 0.5, 2.0, 25.0, 50.0)),
+        (LEF.log1psq,  (-3.0, 0.0, 0.4, 1e5)),
+    ]
+    for (fn, xs) in cases, x0 in xs
+        f = v -> fn(v[1]) * 1.5
+        g = zeros(1); v, _ = rev_value_and_gradient!(g, f, [x0])
+        @test v ≈ f([x0]) rtol=1e-14
+        @test g[1] ≈ ForwardDiff.gradient(f, [x0])[1] rtol=1e-9 atol=1e-300
+    end
+    # Each is ONE node on top of its input.
+    ws = ReverseWorkspace(1)
+    rev_gradient!(zeros(1), v -> LEF.log1pexp(v[1]), [0.3], ws)
+    @test length(ws.tape) == 2
+
+    # The model it was written for: BernoulliLogit's logpdf is -log1pexp(-x).
+    X = randn(Xoshiro(7), 40, 3); yb = rand(Xoshiro(8), Bool, 40)
+    f = b -> sum(logpdf.(BernoulliLogit.(X * b), yb))
+    b0 = [0.3, -0.5, 1.1]
+    g = zeros(3); rev_gradient!(g, f, b0)
+    @test g ≈ ForwardDiff.gradient(f, b0) rtol=1e-10
 end
 
 @testset "reverse: matvec scratch is pooled, not reallocated" begin

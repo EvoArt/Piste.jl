@@ -192,7 +192,8 @@ and it is the single most valuable thing a *caller* can do.
    scalar work in each direction, walking a column-major matrix across its
    stride. Column-major accumulation instead: forward 1345 → 337 µs, backward
    1258 → 373 µs. The adjoint is now deferred into a per-matrix accumulator
-   and flushed once after the sweep.
+   and flushed once after the sweep. *(That flush point was wrong whenever the
+   operands were computed rather than the raw parameters: see "Third pass".)*
 
    **Deliberately not BLAS.** `mul!` scored 263/285 µs, so the hand kernel gets
    ~93% of the win with no LinearAlgebra dependency — and an external BLAS call
@@ -258,3 +259,113 @@ and was not attempted here.
   exists because this was nearly shipped.
 - **A peephole that fires when it should not gives a wrong answer, not an
   error.** The logistic fusion has six near-miss tests for exactly this.
+  *(And a peephole must never rewrite a tape slot: see "Third pass".)*
+
+---
+
+# Third pass: two silent wrong gradients, and the allocation cost
+
+Measured on Athena, Julia 1.12.7, an exclusive Xeon Silver 4216 node (the
+machine the README tables come from), one thread, one BLAS thread. Base is
+`649e249`. Each figure is the better of two BenchmarkTools medians from runs
+interleaved new/base/new/base. Every gradient is checked against ForwardDiff
+in the same run. The suite is 511 tests, passing on 1.10.10 and 1.12.7, and the
+extended `ProbePISTEREV` trims cleanly and matches finite differences.
+
+## Two bugs, both silent, both on master before this
+
+**1. Peepholes reused tape slots the caller still held.** `s + x*c` (fused to
+OP_LINEAR) and `1/(1+exp(-u))` (fused to OP_LOGISTIC) both dropped the nodes
+they fused and recorded the fused node in the freed slot. Any value the caller
+still held from the dropped chain then pointed at the wrong node:
+
+    p = v[1]*2; s = v[2] + p; s + 3p        d/dv[2] = 4, should be 1
+    e = exp(-u); s = 1/(1+e); s + e         +0.244, should be -0.496
+
+Fixed by keeping the chain and appending the fused node: the dead chain gets a
+zero adjoint and is skipped. **A tape slot that a live TapedReal refers to must
+never be rewritten.** This costs node count where the peepholes fire: the
+HMM-shaped microbenchmark (2000 hand-written logistics) went 14 005 → 24 004
+nodes, the source of most of its slowdown below. Code that calls
+`LogExpFunctions.logistic` gets one node from the new extension instead.
+
+**2. The deferred matvec adjoint ignored computed operands.** It was flushed
+after the whole sweep, which is only right when the operands are OP_INPUT
+leaves. Over anything computed -- `X * (2 .* b)`, a non-centred
+`X * (mu .+ sigma .* z)`, a permuted or transformed vector -- the gradient
+through the matvec was exactly **zero**: `[0, 0]` for `[-162.4, -208.0]`. No
+test multiplied by anything but the raw parameter vector. Now each matvec is
+flushed when the sweep reaches the end of its operand span: all its rows are
+recorded later than its operands, so the accumulator is complete there, and the
+operands have not yet been visited. The sweep runs in segments between flush
+points rather than testing `i == hi` per node, because the per-node test cost
+6-8% on a scalar tape with no matvec at all.
+
+## The allocation cost, and the speedups
+
+Profiling the normal regression at N=20000, K=2 showed recording at 24x the
+primal, and a third of the whole gradient in `GenericMemory`, a sixth in
+`_setindex!`, a fifth in GC. The cause: `TapedReal` held a `Tape` reference, so
+every `Vector{TapedReal}` (each matvec output, each `y .- mu`) was an array of
+pointers -- zeroed on allocation, write-barriered on every store, scanned by
+the GC.
+
+1. **`TapedReal` is isbits** (16 bytes: slot, index, value). The tape is named
+   by a slot in a fixed-capacity const table, borrowed per gradient call and
+   returned in `finally` (so an error in `f` cannot leak it, verified past the
+   table's capacity). The table is never resized, so concurrent gradients on
+   other threads each read only their own slot. The borrow costs ~70 ns a call.
+2. **`sum(x)` and `sum(abs2, x)` are one node** over an index list (`ilist`).
+   PDMats' `invquad` for an isotropic covariance is exactly
+   `sum(abs2, x .- mu)`, so the normal log-density went from 4 nodes per
+   observation to 2.
+3. **`PisteLogExpFunctionsExt`** gives `log1pexp`, `logistic`, `logit`,
+   `log1mexp`, `logexpm1` and `log1psq` one node each. On a TapedReal the generic
+   `log1pexp` re-derived its thresholds per call and taped EXP and LOG1P.
+4. Unchecked `Float64 -> Int` in the matvec arm of the sweep (it showed in the
+   profile on every row).
+
+| case | base | new | new/base |
+|---|---:|---:|---:|
+| normal, N=20000, K=2 | 1.05 ms | 500 µs | 0.48 |
+| normal, N=1000, K=2 | 47.2 µs | 22.1 µs | 0.47 |
+| normal, N=50, K=200 | 16.5 µs | 10.4 µs | 0.63 |
+| normal Float32, N=20000, K=200 | 3.11 ms | 2.55 ms | 0.82 |
+| poisson, N=50, K=200 | 18.3 µs | 13.0 µs | 0.71 |
+| bernoulli_logit, N=50, K=200 | 18.9 µs | 13.7 µs | 0.72 |
+| poisson, N=20000, K=2 | 1.82 ms | 1.76 ms | 0.97 |
+| bernoulli_logit, N=20000, K=2 | 2.19 ms | 2.08 ms | 0.95 |
+| least squares, N=5000, K=200 | 915 µs | 778 µs | 0.85 |
+| Rosenbrock, K=200 | 12.3 µs | 12.7 µs | 1.04 |
+| Rosenbrock, K=1000 | 62.5 µs | 64.3 µs | 1.03 |
+| HMM-shaped, 2000 logistics | 152 µs | 178 µs | 1.17 |
+
+Over the 54 reverse-mode model cells (3 likelihoods x 2 precisions x 9 sizes):
+normal median 0.61 (0.46-0.82), poisson 0.96 (0.71-1.01), bernoulli_logit
+0.94 (0.72-0.97). Forward mode is unchanged, median 1.00 over 36 cells.
+Rosenbrock's ~4% is the slot lookup on every op; the HMM's 17% is fix 1.
+
+## The trap: isbits made LLVM emit AVX-512, and the clock dropped
+
+The first measurement of this change had a bimodal slow mode: N=50, K=200
+gradients at 14 µs *or* 20 µs, against a steady 18 µs before. The kernels it
+spent the extra time in were unchanged, and ran identically in isolation. A
+fixed scalar loop timed straight after each gradient settled it: 13.7 µs after
+the old code, 20-29 µs after the new. **The core's clock was dropping.** The
+cause was `_index_span` (does a matvec's operand vector occupy consecutive tape
+slots?): once TapedReal became isbits, LLVM vectorised its flag-and-scan loop
+with zmm registers, 20 uses where there had been none, and on this Xeon that
+costs the core its frequency for every instruction that follows, not just its
+own. Rewriting it with an early exit (not vectorised) removed every zmm use and
+the slow mode. Before changing a loop over `Vector{TapedReal}`, check
+`code_native` for zmm.
+
+## Also noted
+
+- `rev_value_and_gradient!` returned through `adj[0]` under `@inbounds` when
+  `f` returned a detached TapedReal (e.g. `zero(eltype(x))`); it now returns
+  a zero gradient. `_index_span` accepted a detached first entry (index 0) as
+  a span start, which made the flush write `adj[0]`; it no longer does.
+- Several cells looked slower in one A/B run and faster in the next. The
+  same-build spread reached 1.4-1.7x on some cells, so no single run is trusted:
+  every flagged cell was re-timed on its own, with its distribution.

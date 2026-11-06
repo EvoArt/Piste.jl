@@ -88,6 +88,13 @@ const OP_MATVEC = Int8(26)  # one row of X*beta; the matrix lives in the side ta
 # log-likelihood that chain was ~57% of the whole tape. The derivative
 # `s * (1 - s)` is a function of the OUTPUT, so nothing extra need be saved.
 const OP_LOGISTIC = Int8(27)
+# A whole-array reduction as ONE node: `sum(x)` and `sum(abs2, x)` over a vector
+# of tracked values. `a` is the start of the operands' indices in `Tape.ilist`,
+# `b` their count. Recorded elementwise, a sum of N terms is N-1 OP_ADD nodes
+# (and N OP_SQ before them for `abs2`) -- on a normal regression that was half
+# of the tape. See `_record_sum`.
+const OP_SUM   = Int8(28)
+const OP_SUMSQ = Int8(29)
 
 """
     Node
@@ -171,13 +178,23 @@ mutable struct Tape
     # 5000x200 problem, because a row walk touches the whole 8 MB matrix with no
     # blocking while BLAS runs a cache-tiled kernel.
     #
-    # So the sweep only ACCUMULATES `acc[row] = ai` here, and `backward!` issues
-    # one `mul!` per matrix at the end. Same arithmetic, one BLAS call.
+    # So the sweep only ACCUMULATES `acc[row] = ai` here, and `backward!` applies
+    # it in one column-major pass per matrix when the sweep reaches the
+    # matvec's operands (see `backward!` for why then and not at the end).
     accs::Vector{Vector{Float64}}
+    # Operand indices of the array-level reductions (OP_SUM, OP_SUMSQ), packed
+    # end to end; each such node records where its run starts and how long it
+    # is. `ni` is the used length -- like `n` for `nodes`, the storage itself is
+    # kept across `reset!`, so the steady state allocates nothing.
+    ilist::Vector{Int32}
+    ni::Int
+    # This tape's entry in `_SLOTS`, or 0 while it has none. A TapedReal names
+    # its tape by this number rather than by reference; see `TapedReal`.
+    slot::Int32
 end
 
 Tape() = Tape(Node[], 0, Matrix{Float64}[], Matrix{Float32}[], Int32[],
-              UnitRange{Int32}[], Vector{Float64}[])
+              UnitRange{Int32}[], Vector{Float64}[], Int32[], 0, Int32(0))
 
 """
     Tape(capacity::Int)
@@ -186,7 +203,7 @@ Preallocate for a known node count, so even the first sweep does not grow.
 """
 Tape(capacity::Integer) = Tape(Vector{Node}(undef, Int(capacity)), 0,
                               Matrix{Float64}[], Matrix{Float32}[], Int32[],
-                              UnitRange{Int32}[], Vector{Float64}[])
+                              UnitRange{Int32}[], Vector{Float64}[], Int32[], 0, Int32(0))
 
 """
     reset!(t) -> t
@@ -196,6 +213,7 @@ memory. This is what makes repeated gradient calls cheap.
 """
 @inline function reset!(t::Tape)
     t.n = 0
+    t.ni = 0
     empty!(t.mats)
     empty!(t.mats32)
     empty!(t.mref)
@@ -227,27 +245,92 @@ end
 """
     TapedReal <: Real
 
-A value being recorded: a tape index plus its primal.
+A value being recorded: which tape, its index on it, and its primal.
 
 `<: Real` is load-bearing exactly as it is for [`Dual`](@ref) — it is what lets
 `Distributions.logpdf` and other generic numeric code accept these unmodified.
-isbits, so a `Vector{TapedReal}` is a dense array rather than a vector of boxes.
 
-The tape it records onto is passed explicitly rather than kept in a global:
-a non-const global would infer as `Any` and take the whole hot path with it.
+**isbits, 16 bytes.** The tape is named by a slot number into the const table
+`_SLOTS`, not held by reference. Holding a `Tape` reference (the original
+design) made every `Vector{TapedReal}` -- each matvec output, each broadcast
+such as `y .- mu` -- an array of pointers, which Julia must zero on
+allocation, write-barrier on every store, and scan on every collection.
+Measured on an N=20000 normal regression, that was a third of gradient time in
+allocation, a sixth in stores and a fifth in GC. Named by number, those arrays
+are plain bits.
+
+The table is concretely typed and const, so `tape(x)` infers and trims like a
+field read did. A gradient call borrows a slot for its tape and hands it back
+on exit (see [`rev_value_and_gradient!`](@ref)), so the table never grows past
+the number of gradients in flight at once.
 """
 struct TapedReal <: Real
-    tape::Tape
+    slot::Int32
     idx::Int32
     v::Float64
 end
 
+# Record sites still name the tape itself; this stores its slot.
+@inline TapedReal(t::Tape, idx::Int32, v::Float64) = TapedReal(t.slot, idx, v)
+
 @inline value(x::TapedReal) = x.v
-@inline tape(x::TapedReal) = x.tape
+
+# --- the slot table ------------------------------------------------------------
+# Fixed capacity and never resized: a gradient on one thread reads its own slot
+# while another thread may be claiming a different one, and a resize would move
+# the storage out from under the reader. Each slot is written only by the task
+# that holds it, before that task records anything.
+const _MAX_SLOTS = 4096
+const _SLOTS = Vector{Tape}(undef, _MAX_SLOTS)
+const _FREE_SLOTS = Int32[]
+const _NEXT_SLOT = Ref{Int32}(Int32(1))   # slot 1 is `_DETACHED`'s
+const _SLOT_LOCK = Threads.SpinLock()
+
+@inline tape(x::TapedReal) = @inbounds _SLOTS[x.slot]
 
 # A shared, never-swept tape standing for "this value belongs to no recording".
-# Defined here because `record!` guards against it.
+# Defined here because `record!` guards against it. It owns slot 1 for good.
 const _DETACHED = Tape()
+_DETACHED.slot = Int32(1)
+_SLOTS[1] = _DETACHED
+
+# Give `t` a slot. Returns true if it had none, i.e. the caller now owns one and
+# should `_release_slot!` it when done.
+function _claim_slot!(t::Tape)
+    t.slot != Int32(0) && return false
+    lock(_SLOT_LOCK)
+    s = Int32(0)
+    try
+        if isempty(_FREE_SLOTS)
+            if _NEXT_SLOT[] < Int32(_MAX_SLOTS)
+                s = _NEXT_SLOT[] + Int32(1)
+                _NEXT_SLOT[] = s
+            end
+        else
+            s = pop!(_FREE_SLOTS)
+        end
+        s != Int32(0) && (@inbounds _SLOTS[s] = t)
+    finally
+        unlock(_SLOT_LOCK)
+    end
+    s == Int32(0) && error("Piste: more than $(_MAX_SLOTS - 1) reverse-mode tapes in use at once")
+    t.slot = s
+    return true
+end
+
+function _release_slot!(t::Tape)
+    s = t.slot
+    s <= Int32(1) && return nothing
+    t.slot = Int32(0)
+    lock(_SLOT_LOCK)
+    try
+        @inbounds _SLOTS[s] = _DETACHED    # drop the reference so the tape can be freed
+        push!(_FREE_SLOTS, s)
+    finally
+        unlock(_SLOT_LOCK)
+    end
+    return nothing
+end
 
 # Recording onto the detached tape is always a bug: it is shared and never
 # swept, so anything appended there is invisible to the reverse pass while
@@ -283,8 +366,12 @@ end
 Put an input onto the tape. Its adjoint after the reverse sweep is that input's
 gradient component.
 """
-@inline track!(t::Tape, x::Real) =
-    record!(t, OP_INPUT, Int32(0), Int32(0), Float64(x), 0.0)
+@inline function track!(t::Tape, x::Real)
+    # A tape driven by hand (rather than through `rev_gradient!`) gets a slot
+    # here on first use and keeps it; `rev_gradient!` borrows one per call.
+    t.slot == Int32(0) && _claim_slot!(t)
+    return record!(t, OP_INPUT, Int32(0), Int32(0), Float64(x), 0.0)
+end
 
 # A constant becomes a REAL node with no inputs, not a sentinel index.
 #
@@ -312,23 +399,22 @@ gradient component.
     # term of every reduction.
     _isdetached(y) && return x + y.v
     _isdetached(x) && return y + x.v
-    t = x.tape
+    t = tape(x)
     a = x; b = y
-    # PEEPHOLE FUSION. Generic matvec does not call `muladd` on these types --
-    # measured, it emits a `*` then a `+`, giving an OP_MULC and an OP_ADD per
-    # term (2406 and 2415 of them on a 200x10 regression, 28.4 nodes per
-    # observation). Folding `s + x*c` back into one OP_LINEAR halves that.
+    # PEEPHOLE FUSION. `s + x*c` is recorded as one OP_LINEAR reading `x`
+    # directly, so on the sweep the `x*c` node gets a zero adjoint and is skipped.
     #
-    # Safe because it only fires when the operand is the node THIS tape recorded
-    # last: nothing else can have referenced it yet, so rewriting it cannot
-    # change any other node's meaning. Anything else falls through to a plain add.
+    # The OP_MULC is deliberately KEPT, not dropped. Dropping it (rewinding
+    # `t.n` and reusing its slot) was the original version and it was WRONG:
+    # the caller can still hold the `x*c` value, and its index then pointed at
+    # the OP_LINEAR. `p = v[1]*2; s = v[2] + p; s + 3p` returned
+    # d/dv[2] = 4 instead of 1, with no error. A tape slot that a live
+    # TapedReal refers to must never be rewritten.
     if _is_last_mulc(t, b)
-        t.n -= 1                                   # drop the OP_MULC
-        nd = @inbounds t.nodes[t.n + 1]
+        nd = @inbounds t.nodes[b.idx]
         return record!(t, OP_LINEAR, a.idx, nd.a, a.v + b.v, 1.0, nd.c)
     elseif _is_last_mulc(t, a)
-        t.n -= 1
-        nd = @inbounds t.nodes[t.n + 1]
+        nd = @inbounds t.nodes[a.idx]
         return record!(t, OP_LINEAR, b.idx, nd.a, a.v + b.v, 1.0, nd.c)
     end
     return record!(t, OP_ADD, a.idx, b.idx, a.v + b.v, 0.0)
@@ -352,7 +438,7 @@ end
     # double. On an HMM tape CONST+SUB was 31% of all nodes.
     _isdetached(y) && return x + (-y.v)
     _isdetached(x) && return x.v - y
-    t = x.tape
+    t = tape(x)
     return record!(t, OP_SUB, x.idx, y.idx, x.v - y.v, 0.0)
 end
 @inline function Base.:*(x::TapedReal, y::TapedReal)
@@ -361,7 +447,7 @@ end
     # One detached operand is a scalar multiply -- one OP_MULC, not CONST+MUL.
     _isdetached(y) && return x * y.v
     _isdetached(x) && return y * x.v
-    t = x.tape
+    t = tape(x)
     # `x * x` is a square. As an OP_MUL it is correct but pays two adjoint
     # updates to the SAME slot (`adj[a] += ai*v; adj[a] += ai*v`), a
     # read-modify-write dependency the CPU cannot overlap. OP_SQ does it in one.
@@ -376,20 +462,20 @@ end
     # are single nodes via the mixed-argument methods.
     _isdetached(y) && return x * (1.0 / y.v)
     _isdetached(x) && return x.v / y
-    t = x.tape
+    t = tape(x)
     return record!(t, OP_DIV, x.idx, y.idx, x.v / y.v, 0.0)
 end
 @inline Base.:-(x::TapedReal) =
-    record!(x.tape, OP_NEG, x.idx, Int32(0), -x.v, 0.0)
+    record!(tape(x), OP_NEG, x.idx, Int32(0), -x.v, 0.0)
 
 # Mixed Real/TapedReal fast paths: data is plain Float64 and only parameters are
 # tracked, so promoting a scalar to a full tape node on every operation would be
 # pure waste on the hottest loop in a regression model.
 @inline Base.:*(x::TapedReal, c::Real) =
-    record!(x.tape, OP_MULC, x.idx, Int32(0), x.v * Float64(c), Float64(c))
+    record!(tape(x), OP_MULC, x.idx, Int32(0), x.v * Float64(c), Float64(c))
 @inline Base.:*(c::Real, x::TapedReal) = x * c
 @inline Base.:+(x::TapedReal, c::Real) =
-    record!(x.tape, OP_ADDC, x.idx, Int32(0), x.v + Float64(c), Float64(c))
+    record!(tape(x), OP_ADDC, x.idx, Int32(0), x.v + Float64(c), Float64(c))
 @inline Base.:+(c::Real, x::TapedReal) = x + c
 @inline Base.:-(x::TapedReal, c::Real) = x + (-Float64(c))
 # `c - x` is ONE affine node, not a negate followed by an add.
@@ -401,7 +487,7 @@ end
 # coefficient and its adjoint is `ai * c`, which is exactly what is needed with
 # c = -1; the constant addend shifts the primal only and has no adjoint.
 @inline Base.:-(c::Real, x::TapedReal) =
-    record!(x.tape, OP_MULC, x.idx, Int32(0), Float64(c) - x.v, -1.0)
+    record!(tape(x), OP_MULC, x.idx, Int32(0), Float64(c) - x.v, -1.0)
 @inline Base.:/(x::TapedReal, c::Real) = x * (1.0 / Float64(c))
 # `c / x` is ONE node, not a materialised constant plus a full division.
 #
@@ -414,19 +500,19 @@ end
 # was ~36% of the tape.
 @inline function Base.:/(c::Real, x::TapedReal)
     cf = Float64(c)
-    t = x.tape
-    # PEEPHOLE: collapse `1 / (1 + exp(-u))` into a single OP_LOGISTIC.
+    t = tape(x)
+    # PEEPHOLE: `1 / (1 + exp(-u))` as an OP_LOGISTIC reading `u` directly, so
+    # the sweep does one multiply-accumulate and skips the chain below it,
+    # whose adjoints stay zero.
     #
-    # Safe for the same reason `_is_last_mulc` is: it fires only when the
-    # operand chain is the last thing THIS tape recorded, so nothing else can
-    # have referenced those nodes yet and rewriting them cannot change any other
-    # node's meaning. Anything else falls through to the plain reciprocal above.
+    # The NEG/EXP/ADDC chain is KEPT on the tape. Dropping it, as this
+    # originally did, reused slots the caller could still hold: with
+    # `e = exp(-u); s = 1/(1+e); s + e` the gradient came back as +0.244 instead
+    # of -0.496, silently. A tape slot a live TapedReal refers to must never be
+    # rewritten.
     if cf == 1.0
         u = _logistic_src(t, x)
-        if u != Int32(0)
-            t.n -= 3                       # drop the ADDC, EXP and NEG
-            return record!(t, OP_LOGISTIC, u, Int32(0), 1.0 / x.v, 0.0)
-        end
+        u != Int32(0) && return record!(t, OP_LOGISTIC, u, Int32(0), 1.0 / x.v, 0.0)
     end
     return record!(t, OP_MULC, x.idx, Int32(0), cf / x.v, -cf / (x.v * x.v))
 end
@@ -454,21 +540,21 @@ end
     return Int32(0)
 end
 
-@inline Base.exp(x::TapedReal)   = record!(x.tape, OP_EXP,   x.idx, Int32(0), exp(x.v), 0.0)
-@inline Base.log(x::TapedReal)   = record!(x.tape, OP_LOG,   x.idx, Int32(0), log(x.v), 0.0)
-@inline Base.sqrt(x::TapedReal)  = record!(x.tape, OP_SQRT,  x.idx, Int32(0), sqrt(x.v), 0.0)
-@inline Base.sin(x::TapedReal)   = record!(x.tape, OP_SIN,   x.idx, Int32(0), sin(x.v), 0.0)
-@inline Base.cos(x::TapedReal)   = record!(x.tape, OP_COS,   x.idx, Int32(0), cos(x.v), 0.0)
-@inline Base.tan(x::TapedReal)   = record!(x.tape, OP_TAN,   x.idx, Int32(0), tan(x.v), 0.0)
-@inline Base.tanh(x::TapedReal)  = record!(x.tape, OP_TANH,  x.idx, Int32(0), tanh(x.v), 0.0)
-@inline Base.atan(x::TapedReal)  = record!(x.tape, OP_ATAN,  x.idx, Int32(0), atan(x.v), 0.0)
-@inline Base.abs(x::TapedReal)   = record!(x.tape, OP_ABS,   x.idx, Int32(0), abs(x.v), 0.0)
-@inline Base.log1p(x::TapedReal) = record!(x.tape, OP_LOG1P, x.idx, Int32(0), log1p(x.v), 0.0)
-@inline Base.expm1(x::TapedReal) = record!(x.tape, OP_EXPM1, x.idx, Int32(0), expm1(x.v), 0.0)
+@inline Base.exp(x::TapedReal)   = record!(tape(x), OP_EXP,   x.idx, Int32(0), exp(x.v), 0.0)
+@inline Base.log(x::TapedReal)   = record!(tape(x), OP_LOG,   x.idx, Int32(0), log(x.v), 0.0)
+@inline Base.sqrt(x::TapedReal)  = record!(tape(x), OP_SQRT,  x.idx, Int32(0), sqrt(x.v), 0.0)
+@inline Base.sin(x::TapedReal)   = record!(tape(x), OP_SIN,   x.idx, Int32(0), sin(x.v), 0.0)
+@inline Base.cos(x::TapedReal)   = record!(tape(x), OP_COS,   x.idx, Int32(0), cos(x.v), 0.0)
+@inline Base.tan(x::TapedReal)   = record!(tape(x), OP_TAN,   x.idx, Int32(0), tan(x.v), 0.0)
+@inline Base.tanh(x::TapedReal)  = record!(tape(x), OP_TANH,  x.idx, Int32(0), tanh(x.v), 0.0)
+@inline Base.atan(x::TapedReal)  = record!(tape(x), OP_ATAN,  x.idx, Int32(0), atan(x.v), 0.0)
+@inline Base.abs(x::TapedReal)   = record!(tape(x), OP_ABS,   x.idx, Int32(0), abs(x.v), 0.0)
+@inline Base.log1p(x::TapedReal) = record!(tape(x), OP_LOG1P, x.idx, Int32(0), log1p(x.v), 0.0)
+@inline Base.expm1(x::TapedReal) = record!(tape(x), OP_EXPM1, x.idx, Int32(0), expm1(x.v), 0.0)
 @inline Base.abs2(x::TapedReal) =
-    record!(x.tape, OP_SQ, x.idx, Int32(0), x.v * x.v, 0.0)
+    record!(tape(x), OP_SQ, x.idx, Int32(0), x.v * x.v, 0.0)
 @inline Base.inv(x::TapedReal) =
-    record!(x.tape, OP_MULC, x.idx, Int32(0), inv(x.v), -inv(x.v * x.v))
+    record!(tape(x), OP_MULC, x.idx, Int32(0), inv(x.v), -inv(x.v * x.v))
 
 # Two-argument atan. Without it both arguments promote and recurse forever — a
 # StackOverflowError, not a MethodError, which makes it look worse than it is.
@@ -480,19 +566,19 @@ end
 @inline function Base.atan(y::TapedReal, x::TapedReal)
     den = y.v * y.v + x.v * x.v
     v = atan(y.v, x.v)
-    isfinite(den) || return constant!(y.tape, v)
-    return record!(y.tape, OP_ATAN2, y.idx, x.idx, v, den)
+    isfinite(den) || return constant!(tape(y), v)
+    return record!(tape(y), OP_ATAN2, y.idx, x.idx, v, den)
 end
-@inline Base.atan(y::TapedReal, x::Real) = atan(y, constant!(y.tape, x))
-@inline Base.atan(y::Real, x::TapedReal) = atan(constant!(x.tape, y), x)
+@inline Base.atan(y::TapedReal, x::Real) = atan(y, constant!(tape(y), x))
+@inline Base.atan(y::Real, x::TapedReal) = atan(constant!(tape(x), y), x)
 
 @inline Base.:^(x::TapedReal, n::Integer) =
-    n == 2 ? record!(x.tape, OP_SQ, x.idx, Int32(0), x.v * x.v, 0.0) :
-             record!(x.tape, OP_MULC, x.idx, Int32(0), x.v^n, n * x.v^(n - 1))
+    n == 2 ? record!(tape(x), OP_SQ, x.idx, Int32(0), x.v * x.v, 0.0) :
+             record!(tape(x), OP_MULC, x.idx, Int32(0), x.v^n, n * x.v^(n - 1))
 @inline Base.literal_pow(::typeof(^), x::TapedReal, ::Val{2}) =
-    record!(x.tape, OP_SQ, x.idx, Int32(0), x.v * x.v, 0.0)
+    record!(tape(x), OP_SQ, x.idx, Int32(0), x.v * x.v, 0.0)
 @inline Base.literal_pow(::typeof(^), x::TapedReal, ::Val{p}) where {p} =
-    record!(x.tape, OP_MULC, x.idx, Int32(0), x.v^p, p * x.v^(p - 1))
+    record!(tape(x), OP_MULC, x.idx, Int32(0), x.v^p, p * x.v^(p - 1))
 
 # -----------------------------------------------------------------------------
 # Statement-level rules.
@@ -518,7 +604,7 @@ statement-level taping pays first.
 @inline function Base.muladd(x::TapedReal, y::TapedReal, z::TapedReal)
     (_isdetached(x) && _isdetached(y) && _isdetached(z)) &&
         return TapedReal(_DETACHED, Int32(0), muladd(x.v, y.v, z.v))
-    t = _isdetached(x) ? (_isdetached(y) ? z.tape : y.tape) : x.tape
+    t = _isdetached(x) ? (_isdetached(y) ? tape(z) : tape(y)) : tape(x)
     a = _attach(t, x); b = _attach(t, y); c = _attach(t, z)
     # ∂/∂a = b.v, ∂/∂b = a.v, ∂/∂c = 1. Only two partials need saving; the
     # third input's adjoint is added unscaled, so it rides in the `b` slot of a
@@ -574,7 +660,7 @@ per two inputs instead of four.
 function dot_tracked(xs::AbstractVector{TapedReal}, cs::AbstractVector{<:Real})
     n = length(xs)
     n == 0 && return TapedReal(_DETACHED, Int32(0), 0.0)
-    t = xs[1].tape
+    t = tape(xs[1])
     @inbounds begin
         acc = _linear1(t, xs[1], Float64(cs[1]))
         i = 2
@@ -729,23 +815,32 @@ end
     return s
 end
 
-@inline function _livetape_vec(b::AbstractVector{TapedReal})
+@inline function _livetape_vec(b::AbstractArray{TapedReal})
     @inbounds for x in b
-        _isdetached(x) || return x.tape
+        _isdetached(x) || return tape(x)
     end
     return _DETACHED
 end
 
 # Are the tracked entries a contiguous ascending run of tape indices?
+#
+# Written with an EARLY EXIT on purpose, not as a full scan with a flag. Since
+# TapedReal became isbits, LLVM vectorises the flag-and-scan form with 512-bit
+# (zmm) instructions, and on AVX-512 Xeons that drops the core's clock: on a
+# Xeon Silver 4216 a fixed scalar loop ran 1.5-2x slower after each gradient,
+# and the gradient itself went bimodal (14 us or 20 us at N=50, P=200 where it
+# had been a steady 18). A loop with an early exit is not vectorised. Check
+# `code_native` for zmm before changing this.
 function _index_span(b::AbstractVector{TapedReal})
+    n = length(b)
     @inbounds lo = b[1].idx
-    hi = lo
-    ok = true
-    @inbounds for j in 2:length(b)
-        b[j].idx == b[j-1].idx + Int32(1) || (ok = false)
-        hi = b[j].idx
+    # A detached first entry (index 0) is never a valid span start, even when
+    # the next entry happens to be tape index 1: the flush would write adj[0].
+    lo == Int32(0) && return lo, (@inbounds b[n].idx), false
+    @inbounds for j in 2:n
+        b[j].idx == lo + Int32(j - 1) || return lo, b[n].idx, false
     end
-    return lo, hi, ok && (hi - lo + Int32(1) == Int32(length(b)))
+    return lo, lo + Int32(n - 1), true
 end
 
 # Flush one matrix's DEFERRED matvec adjoint: `adj[base:base+k-1] += X' * acc`.
@@ -768,6 +863,49 @@ function _flush_matvec!(adj::Vector{Float64}, Xm::Matrix{T},
     return nothing
 end
 
+# `sum(x)` and `sum(abs2, x)` over tracked values: a whole-array reduction
+# recorded as ONE node, its operands' tape indices kept in the tape's `ilist`
+# side buffer.
+#
+# Recorded elementwise, `sum(abs2, r)` over N residuals is N OP_SQ and N-1
+# OP_ADD nodes. That is the inner product of every normal log-density --
+# PDMats' `invquad` for an isotropic covariance is exactly
+# `sum(abs2, x .- mu)` -- and on an N=20000 regression those two node kinds
+# were half of the tape. As one node, the forward pass writes a 4-byte index per
+# term instead of two 40-byte nodes, and the reverse sweep is one tight loop.
+#
+# The primal is summed left to right rather than pairwise. The difference is
+# rounding in the last bits of a Float64; the gradient is exact either way.
+# (A comment, not a docstring: a docstring here would attach to `Base.sum`.)
+Base.sum(x::AbstractArray{TapedReal}) = _record_sum(x, false)
+Base.sum(::typeof(abs2), x::AbstractArray{TapedReal}) = _record_sum(x, true)
+
+function _record_sum(x::AbstractArray{TapedReal}, sq::Bool)
+    t = _livetape_vec(x)
+    s = 0.0
+    if t === _DETACHED            # all constants (or empty): nothing to record
+        @inbounds for xi in x
+            s += sq ? xi.v * xi.v : xi.v
+        end
+        return TapedReal(_DETACHED, Int32(0), s)
+    end
+    start = t.ni
+    need = start + length(x)
+    length(t.ilist) < need && resize!(t.ilist, max(need, 2 * length(t.ilist)))
+    m = start
+    il = t.ilist
+    @inbounds for xi in x
+        v = xi.v
+        s += sq ? v * v : v
+        # A detached entry is a constant: it moves the value, not the gradient.
+        _isdetached(xi) && continue
+        m += 1
+        il[m] = xi.idx
+    end
+    t.ni = m
+    return record!(t, sq ? OP_SUMSQ : OP_SUM, Int32(start + 1), Int32(m - start), s, 0.0)
+end
+
 @inline _linear1(t::Tape, x::TapedReal, c::Float64) =
     record!(t, OP_MULC, _attach(t, x).idx, Int32(0), x.v * c, c)
 
@@ -777,10 +915,10 @@ end
 # through differentiable arithmetic), here the primal is a plain Float64
 # recorded once and the derivative is digamma, so calling out is fine.
 SpecialFunctions._logabsgamma(x::TapedReal) =
-    (record!(x.tape, OP_LGAMMA, x.idx, Int32(0),
+    (record!(tape(x), OP_LGAMMA, x.idx, Int32(0),
              SpecialFunctions.logabsgamma(x.v)[1], 0.0), 1)
 SpecialFunctions.loggamma(x::TapedReal) =
-    record!(x.tape, OP_LGAMMA, x.idx, Int32(0), SpecialFunctions.loggamma(x.v), 0.0)
+    record!(tape(x), OP_LGAMMA, x.idx, Int32(0), SpecialFunctions.loggamma(x.v), 0.0)
 
 # --- the `<: Real` contract --------------------------------------------------
 # A constant converted into tracked-land needs a tape, and `convert` is not
@@ -816,7 +954,7 @@ Base.convert(::Type{TapedReal}, x::TapedReal) = x
 # The live tape of a binary operation: whichever operand actually has one.
 # Both detached means both are constants, and the caller handles that case by
 # never reaching the tape at all.
-@inline _livetape(x::TapedReal, y::TapedReal) = _isdetached(x) ? y.tape : x.tape
+@inline _livetape(x::TapedReal, y::TapedReal) = _isdetached(x) ? tape(y) : tape(x)
 
 # Put a detached constant onto a live tape so it can be used as an input.
 @inline _attach(t::Tape, x::TapedReal) =
@@ -854,8 +992,8 @@ Base.precision(x::TapedReal) = precision(Float64)
 # The step is infinitesimal, so the derivative is unchanged: only the primal
 # moves. Returning the value with its partials intact is the right answer;
 # treating it as a constant would silently zero a gradient.
-@inline Base.nextfloat(x::TapedReal) = TapedReal(x.tape, x.idx, nextfloat(x.v))
-@inline Base.prevfloat(x::TapedReal) = TapedReal(x.tape, x.idx, prevfloat(x.v))
+@inline Base.nextfloat(x::TapedReal) = TapedReal(x.slot, x.idx, nextfloat(x.v))
+@inline Base.prevfloat(x::TapedReal) = TapedReal(x.slot, x.idx, prevfloat(x.v))
 @inline Base.eps(::Type{TapedReal}) = eps(Float64)
 # Float introspection, all answering about the primal -- see the matching block
 # in Piste.jl. Queries, not operations, so nothing is recorded.
@@ -868,7 +1006,7 @@ Base.precision(x::TapedReal) = precision(Float64)
 @inline Base.decompose(x::TapedReal) = Base.decompose(x.v)
 # ldexp scales by a power of two, so the partials scale identically.
 @inline Base.ldexp(x::TapedReal, e::Integer) =
-    record!(x.tape, OP_MULC, x.idx, Int32(0), ldexp(x.v, e), ldexp(1.0, e))
+    record!(tape(x), OP_MULC, x.idx, Int32(0), ldexp(x.v, e), ldexp(1.0, e))
 Base.round(x::TapedReal) = round(x.v)
 Base.floor(x::TapedReal) = floor(x.v)
 Base.ceil(x::TapedReal) = ceil(x.v)
@@ -911,9 +1049,42 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
             a[i] = 0.0
         end
     end
+    # Each matvec's deferred adjoint is applied when the sweep reaches the END
+    # of its operand span (`hi`), not after the whole loop.
+    #
+    # Every row of a matvec is recorded after its operands, so by the time the
+    # sweep is at `hi` all rows have been visited and the accumulator is
+    # complete -- and the operands themselves have not been processed yet, so
+    # their adjoints flow on to whatever produced them. Flushing after the loop
+    # (the original version) was only right when the operands were OP_INPUT
+    # leaves: `X * (2 .* b)` returned a ZERO gradient, silently, because the
+    # re-recorded operands were never visited again. For leaf operands this is
+    # the same arithmetic, applied earlier.
+    #
+    # The tape is swept in SEGMENTS between flush points, rather than testing
+    # `i == hi` on every node: that per-node test measured 6-8% on a scalar
+    # tape with no matvec at all (Rosenbrock, K=200). A tape without a matvec
+    # is one segment, i.e. exactly the plain loop.
+    hi = n
+    nexthi = _next_flush(t, typemax(Int))
+    while true
+        _sweep!(adj, t, hi, nexthi + 1)
+        nexthi == 0 && break
+        @inbounds for m in 1:length(t.mref)
+            Int(last(t.idxs[m])) == nexthi && _flush_one!(adj, t, m)
+        end
+        hi = nexthi
+        nexthi = _next_flush(t, nexthi)
+    end
+    return adj
+end
+
+# Process nodes `hi` down to `lo`. One loop, one branch on a concrete `Int8`,
+# every arm statically known -- the shape that lets the trimmer see through it.
+function _sweep!(adj::Vector{Float64}, t::Tape, hi::Int, lo::Int)
     nodes = t.nodes
     accs = t.accs
-    @inbounds for i in n:-1:1
+    @inbounds for i in hi:-1:lo
         ai = adj[i]
         # Skipping zero adjoints is a real saving: a log-density's tape has many
         # nodes that never reach the output.
@@ -978,7 +1149,24 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
             # `adj[base:base+k-1] += X' * acc` is applied once per matrix after
             # the loop, which is the same arithmetic as one BLAS-shaped pass
             # instead of a strided row walk per node. See `_flush_matvec!`.
-            accs[Int(nd.c)][Int(nd.d)] = ai
+            # Unchecked: both were stored from exact integers at record time,
+            # and the checked `Int(::Float64)` (isinteger + trap) showed in the
+            # profile on every row.
+            accs[unsafe_trunc(Int, nd.c)][unsafe_trunc(Int, nd.d)] = ai
+        elseif op == OP_SUM
+            # `a` is where this reduction's operand indices start in `ilist`,
+            # `b` how many there are.
+            il = t.ilist
+            for j in Int(nd.a):(Int(nd.a) + Int(nd.b) - 1)
+                adj[il[j]] += ai
+            end
+        elseif op == OP_SUMSQ
+            il = t.ilist
+            ai2 = 2.0 * ai
+            for j in Int(nd.a):(Int(nd.a) + Int(nd.b) - 1)
+                k = il[j]
+                adj[k] += ai2 * nodes[k].v
+            end
         elseif op == OP_FMA || op == OP_LINEAR
             # Both saved their two partials at record time, which is the whole
             # point: the reverse sweep is two multiply-accumulates for what
@@ -988,26 +1176,35 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
         end
         # OP_INPUT and OP_CONST have no inputs: the adjoint stops there.
     end
-    # Apply the deferred matvec adjoints, one pass per matrix.
-    #
-    # Doing this AFTER the loop is sound because a matvec's operands are the
-    # tracked parameter vector, whose nodes are OP_INPUT leaves: the adjoint
-    # stops there, so nothing downstream reads `adj[base:base+k-1]` again. A
-    # matvec over a COMPUTED vector would break that assumption, which is why
-    # `_matvec_taped` re-records non-contiguous operands as leaves first.
-    # `mref` says which typed table holds matrix `m`; each branch calls the
-    # kernel on a concrete matrix type, so there is no dynamic dispatch here.
+    return adj
+end
+
+# The largest operand-span end `hi` among the matvecs whose `hi` is below
+# `bound`, or 0 if there is none: the next point at which the sweep must flush.
+@inline function _next_flush(t::Tape, bound::Int)
+    best = 0
     @inbounds for m in 1:length(t.mref)
+        h = Int(last(t.idxs[m]))
+        (h < bound && h > best) && (best = h)
+    end
+    return best
+end
+
+# Apply matrix `m`'s deferred adjoint: `adj[span] += X' * acc`. `mref` says
+# which typed table holds the matrix; each branch calls the kernel on a
+# concrete matrix type, so there is no dynamic dispatch here.
+@inline function _flush_one!(adj::Vector{Float64}, t::Tape, m::Int)
+    @inbounds begin
         r = t.idxs[m]
         base = Int(first(r)); k = Int(last(r)) - base + 1
         j = t.mref[m]
         if j > 0
-            _flush_matvec!(adj, t.mats[j], accs[m], base, k)
+            _flush_matvec!(adj, t.mats[j], t.accs[m], base, k)
         else
-            _flush_matvec!(adj, t.mats32[-j], accs[m], base, k)
+            _flush_matvec!(adj, t.mats32[-j], t.accs[m], base, k)
         end
     end
-    return adj
+    return nothing
 end
 
 """
@@ -1076,14 +1273,28 @@ has already computed, so it costs nothing extra.
 # interface converts, so `eltype(g)` is preserved exactly.
 function rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real},
                                  ws::ReverseWorkspace) where {F}
+    t = ws.tape
+    # Borrow a slot for this call, unless the tape already holds one for good
+    # (it was driven by hand through `track!`). Released in `finally`, so an
+    # error inside `f` cannot leak it.
+    owned = _claim_slot!(t)
+    try
+        return _rev_value_and_gradient!(g, f, x, ws, t)
+    finally
+        owned && _release_slot!(t)
+    end
+end
+
+function _rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real},
+                                  ws::ReverseWorkspace, t::Tape) where {F}
     K = length(x)
     length(ws.xs) < K && resize!(ws.xs, K)
-    t = reset!(ws.tape)
+    reset!(t)
     @inbounds for i in 1:K
         ws.xs[i] = track!(t, Float64(x[i]))
     end
     y = f(view(ws.xs, 1:K))
-    if y isa TapedReal
+    if y isa TapedReal && y.idx != Int32(0)
         backward!(ws.adj, t, y.idx)
         @inbounds for i in 1:K
             g[i] = convert(eltype(g), ws.adj[ws.xs[i].idx])
@@ -1092,8 +1303,10 @@ function rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVec
     end
     # `f` returned something untracked, i.e. it does not actually depend on `x`.
     # A zero gradient is the right answer, and saying so beats a confusing error.
+    # That includes a DETACHED TapedReal (e.g. `zero(eltype(x))`): its index is
+    # 0, and seeding `adj[0]` under `@inbounds` would write outside the buffer.
     fill!(g, zero(eltype(g)))
-    return (convert(eltype(g), y), g)
+    return (convert(eltype(g), y isa TapedReal ? y.v : y), g)
 end
 
 rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real}) where {F} =
