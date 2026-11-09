@@ -1,7 +1,7 @@
 name = "Piste"
 uuid = "f69a1a94-130c-4fa4-b8d2-e36d656cbe66"
 authors = ["Arthur Newbury <arthur.newbury@gmail.com>"]
-version = "0.3.0"
+version = "0.4.0"
 
 # SpecialFunctions is the ONLY runtime dependency, and only so that
 # `_logabsgamma` can be given a Dual method — that one function gates the whole

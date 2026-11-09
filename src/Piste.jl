@@ -87,7 +87,7 @@ using SpecialFunctions: SpecialFunctions
 
 export Dual, value, partials, gradient!, value_and_gradient!, GradientWorkspace, pickchunk
 export TapedReal, Tape, ReverseWorkspace, track!, backward!, reset!
-export rev_gradient!, rev_value_and_gradient!
+export rev_gradient!, rev_value_and_gradient!, rev_value_and_pullback!, rev_value_and_pullback
 
 # -----------------------------------------------------------------------------
 # The number type
@@ -139,7 +139,6 @@ Base.zero(::Type{Dual{N,T}}) where {N,T} = Dual{N,T}(zero(T), _zerotup(Val(N), T
 Base.one(::Type{Dual{N,T}}) where {N,T} = Dual{N,T}(one(T), _zerotup(Val(N), T))
 Base.zero(x::Dual) = zero(typeof(x))
 Base.one(x::Dual) = one(typeof(x))
-Base.eltype(::Type{Dual{N,T}}) where {N,T} = T
 Base.float(x::Dual) = x
 Base.typemin(::Type{Dual{N,T}}) where {N,T} = Dual{N,T}(typemin(T))
 Base.typemax(::Type{Dual{N,T}}) where {N,T} = Dual{N,T}(typemax(T))

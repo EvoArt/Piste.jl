@@ -968,7 +968,6 @@ Base.convert(::Type{TapedReal}, x::TapedReal) = x
 TapedReal(x::Real) = TapedReal(_DETACHED, Int32(0), Float64(x))
 
 Base.float(x::TapedReal) = x
-Base.eltype(::Type{TapedReal}) = Float64
 
 # Predicates answer about the VALUE — that is what lets `logpdf`'s support
 # checks (`insupport`, `x < 0`, `isinteger` on a discrete observation) work
@@ -1027,6 +1026,15 @@ One loop, one branch on a concrete `Int8`, every arm statically known. That
 shape is what lets the trimmer see through it.
 """
 function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
+    _zero_adjoints!(adj, t)
+    @inbounds adj[out] = 1.0
+    return _reverse_sweep!(adj, t)
+end
+
+# Split out of `backward!` so a pullback can seed SEVERAL outputs (one adjoint
+# per element of an array-valued `f`) before the one sweep. See
+# `rev_value_and_pullback!`.
+function _zero_adjoints!(adj::Vector{Float64}, t::Tape)
     n = t.n
     # Grow only when the reused buffer is genuinely too small; in the steady
     # state (a sampler calling this once per leapfrog step on a fixed model)
@@ -1035,7 +1043,6 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
     @inbounds for i in 1:n
         adj[i] = 0.0
     end
-    @inbounds adj[out] = 1.0
     # Zero the deferred matvec accumulators before the sweep.
     #
     # This is NOT redundant with `_claim_acc!`. The forward pass borrows each
@@ -1049,6 +1056,12 @@ function backward!(adj::Vector{Float64}, t::Tape, out::Integer)
             a[i] = 0.0
         end
     end
+    return adj
+end
+
+# Walk the tape backwards from whatever adjoints have been seeded.
+function _reverse_sweep!(adj::Vector{Float64}, t::Tape)
+    n = t.n
     # Each matvec's deferred adjoint is applied when the sweep reaches the END
     # of its operand span (`hi`), not after the whole loop.
     #
@@ -1311,3 +1324,112 @@ end
 
 rev_value_and_gradient!(g::AbstractVector{<:Real}, f::F, x::AbstractVector{<:Real}) where {F} =
     rev_value_and_gradient!(g, f, x, ReverseWorkspace(length(x)))
+
+"""
+    rev_value_and_pullback!(dx, f, x, dy, ws) -> (y, dx)
+    rev_value_and_pullback!(dx, f, x, dy)     -> (y, dx)
+    rev_value_and_pullback(f, x::Real, dy, ws) -> (y, dx)
+    rev_value_and_pullback(f, x::Real, dy)     -> (y, dx)
+
+Vector-Jacobian product in reverse mode: `dx = J' * dy`, where `J` is the
+Jacobian of `f` at `x`, returned with the primal `y = f(x)`.
+
+`f` may return a real number or an array of reals, and `dy` has the same shape
+as that output. `x` may be an array of any shape, in which case the result is
+written into `dx` (same shape as `x`), or a real number, in which case use the
+non-mutating form. Either way it costs one recording of `f` and one reverse
+sweep, however large the output is.
+
+[`rev_value_and_gradient!`](@ref) is the special case of a scalar `f` with
+`dy = 1`.
+
+The returned primal is `Float64` (an array of them if `f` returns an array),
+since that is what the tape holds. `dx` keeps its own element type.
+
+```julia
+f(x) = [x[1] * x[2], sin(x[1])]
+x = [0.7, 1.3]
+dx = similar(x)
+ws = ReverseWorkspace(length(x))
+y, dx = rev_value_and_pullback!(dx, f, x, [1.0, -2.0], ws)
+```
+"""
+function rev_value_and_pullback!(dx::AbstractArray{<:Real}, f::F, x::AbstractArray{<:Real},
+                                 dy, ws::ReverseWorkspace) where {F}
+    length(dx) == length(x) ||
+        throw(DimensionMismatch("rev_value_and_pullback!: dx and x must have the same length"))
+    t = ws.tape
+    owned = _claim_slot!(t)
+    try
+        K = length(x)
+        length(ws.xs) < K && resize!(ws.xs, K)
+        reset!(t)
+        for (i, xi) in enumerate(x)
+            @inbounds ws.xs[i] = track!(t, Float64(xi))
+        end
+        y = f(_taped_input(x, ws.xs, K))
+        _seed_and_sweep!(ws.adj, t, y, dy)
+        for (i, I) in enumerate(eachindex(dx))
+            @inbounds dx[I] = convert(eltype(dx), ws.adj[ws.xs[i].idx])
+        end
+        return (_primal(y), dx)
+    finally
+        owned && _release_slot!(t)
+    end
+end
+
+rev_value_and_pullback!(dx::AbstractArray{<:Real}, f::F, x::AbstractArray{<:Real}, dy) where {F} =
+    rev_value_and_pullback!(dx, f, x, dy, ReverseWorkspace(length(x)))
+
+function rev_value_and_pullback(f::F, x::Real, dy, ws::ReverseWorkspace) where {F}
+    t = ws.tape
+    owned = _claim_slot!(t)
+    try
+        reset!(t)
+        xt = track!(t, Float64(x))
+        y = f(xt)
+        _seed_and_sweep!(ws.adj, t, y, dy)
+        return (_primal(y), oftype(float(x), @inbounds ws.adj[xt.idx]))
+    finally
+        owned && _release_slot!(t)
+    end
+end
+
+rev_value_and_pullback(f::F, x::Real, dy) where {F} =
+    rev_value_and_pullback(f, x, dy, ReverseWorkspace(1))
+
+# A vector input is handed to `f` as a view of the tracked buffer, exactly as
+# `rev_value_and_gradient!` does; any other shape is reshaped to match `x`, so
+# `f` sees the array shape it was written for.
+@inline _taped_input(::AbstractVector, xs::Vector{TapedReal}, K::Int) = view(xs, 1:K)
+@inline _taped_input(x::AbstractArray, xs::Vector{TapedReal}, K::Int) =
+    reshape(view(xs, 1:K), size(x))
+
+# Seed every output's adjoint with its cotangent, then sweep once. Seeding with
+# `+=` is what makes an output that appears twice (`[x[1], x[1]]`) count twice.
+function _seed_and_sweep!(adj::Vector{Float64}, t::Tape, y, dy)
+    _zero_adjoints!(adj, t)
+    _seed!(adj, y, dy)
+    _reverse_sweep!(adj, t)
+    return adj
+end
+
+# A detached or untracked output is a constant: it has nothing to seed, and its
+# index 0 must never be written (see `_rev_value_and_gradient!`).
+@inline function _seed!(adj::Vector{Float64}, y::TapedReal, dy::Real)
+    _isdetached(y) || (@inbounds adj[y.idx] += Float64(dy))
+    return nothing
+end
+@inline _seed!(::Vector{Float64}, ::Real, ::Real) = nothing
+function _seed!(adj::Vector{Float64}, y::AbstractArray, dy::AbstractArray)
+    length(y) == length(dy) ||
+        throw(DimensionMismatch("rev_value_and_pullback!: dy must have the shape of f(x)"))
+    for (yi, dyi) in zip(y, dy)
+        _seed!(adj, yi, dyi)
+    end
+    return nothing
+end
+
+@inline _primal(y::TapedReal) = y.v
+@inline _primal(y::Real) = y
+_primal(y::AbstractArray) = map(_primal, y)

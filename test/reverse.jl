@@ -604,3 +604,74 @@ end
     a = @allocated rev_gradient!(g32, f32, x, ws32)
     @test a < 2 * (500 * sizeof(TapedReal) + 500 * sizeof(Float64))
 end
+
+@testset "reverse: pullback (vector-Jacobian product) vs ForwardDiff" begin
+    rng = Xoshiro(41)
+    X = randn(rng, 5, 3)
+    x = randn(Xoshiro(42), 3)
+
+    # Vector in, vector out, through a matvec so the deferred-adjoint path is used.
+    f = b -> exp.(X * b) .+ sin(b[1]) .* b[2]
+    dy = randn(Xoshiro(43), 5)
+    dx = zeros(3)
+    y, dx = rev_value_and_pullback!(dx, f, x, dy, ReverseWorkspace(3))
+    @test y ≈ f(x)
+    @test dx ≈ ForwardDiff.jacobian(f, x)' * dy rtol=1e-10
+
+    # Scalar output: the pullback is the gradient scaled by the cotangent.
+    h = b -> sum(abs2, X * b) + exp(b[1])
+    g = zeros(3)
+    rev_gradient!(g, h, x)
+    v, dx = rev_value_and_pullback!(zeros(3), h, x, -2.5)
+    @test v ≈ h(x)
+    @test dx ≈ -2.5 .* g rtol=1e-12
+
+    # Matrix in, matrix out: `f` must see the input's own shape.
+    M = randn(Xoshiro(44), 2, 3)
+    fm = A -> A' * A .+ log1p.(A .^ 2)[1]
+    dY = randn(Xoshiro(45), 3, 3)
+    dM = zeros(2, 3)
+    Y, dM = rev_value_and_pullback!(dM, fm, M, dY)
+    @test Y ≈ fm(M)
+    @test vec(dM) ≈ ForwardDiff.jacobian(A -> vec(fm(A)), M)' * vec(dY) rtol=1e-10
+
+    # Scalar input.
+    fs = t -> [sin(t), t^3, 2t]
+    yv, dt = rev_value_and_pullback(fs, 0.7, [1.0, -1.0, 0.5])
+    @test yv ≈ fs(0.7)
+    @test dt ≈ cos(0.7) - 3 * 0.7^2 + 1.0
+
+    # A workspace is reusable across calls of different shapes.
+    ws = ReverseWorkspace(1)
+    _, dx1 = rev_value_and_pullback!(zeros(3), f, x, dy, ws)
+    _, dx2 = rev_value_and_pullback!(zeros(3), f, x, dy, ws)
+    @test dx1 == dx2
+end
+
+@testset "reverse: pullback seeds repeated and constant outputs (regression)" begin
+    # An output that appears twice must count twice, and an output that does
+    # not depend on `x` (here a detached `zero`) must not be seeded at all:
+    # its index is 0, and writing `adj[0]` under `@inbounds` is out of bounds.
+    f = b -> [b[1], b[1], zero(eltype(b)), b[2] * b[1]]
+    x = [0.3, -1.1]
+    dy = [1.0, 2.0, 100.0, -1.0]
+    y, dx = rev_value_and_pullback!(zeros(2), f, x, dy)
+    @test y ≈ [0.3, 0.3, 0.0, -0.33]
+    @test dx ≈ [1.0 + 2.0 - x[2], -x[1]]
+end
+
+@testset "broadcasting with a scalar Dual / TapedReal (regression)" begin
+    # `eltype` of a Number type must be the type itself: broadcasting reads it
+    # to size the output, so `eltype(Dual) == Float64` allocated a Float64
+    # array for `[1, 2] .* d` and then failed to store a Dual in it.
+    @test eltype(Dual{2,Float64}) === Dual{2,Float64}
+    @test eltype(TapedReal) === TapedReal
+    d = Dual{1,Float64}(0.5, (1.0,))
+    y = sin.([1, 2] .* d)
+    @test y isa Vector{Dual{1,Float64}}
+    @test value.(y) ≈ sin.([1, 2] .* 0.5)
+    @test [partials(yi, 1) for yi in y] ≈ [1, 2] .* cos.([1, 2] .* 0.5)
+    y, dx = rev_value_and_pullback(x -> sin.([1, 2] .* x), 0.5, [1.0, 1.0])
+    @test y ≈ sin.([1, 2] .* 0.5)
+    @test dx ≈ sum([1, 2] .* cos.([1, 2] .* 0.5))
+end

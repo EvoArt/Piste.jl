@@ -13,6 +13,7 @@ using Piste
 using Piste: Dual, value, partials, gradient!, value_and_gradient!
 using Piste: GradientWorkspace, pickchunk
 using Piste: TapedReal, Tape, ReverseWorkspace, track!, reset!, rev_gradient!, rev_value_and_gradient!
+using Piste: rev_value_and_pullback!, rev_value_and_pullback
 import SpecialFunctions
 import LogExpFunctions          # activates ext/PisteLogExpFunctionsExt.jl
 using Test
